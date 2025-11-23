@@ -115,7 +115,7 @@ if st.session_state['df_viz'] is not None:
                         "SELECT * FROM dataframe WHERE " + predicate
                     ).df()
                     
-                    st.toast(f"Selected {len(selection):,} reviews", icon="📊")
+                    # st.toast(f"Selected {len(selection):,} reviews", icon="📊")
                     
                     # Store selection in session state
                     st.session_state['selected_data'] = selection
@@ -200,7 +200,7 @@ Please answer the user's question based on these reviews."""
                                         'content': response
                                     })
                                     
-                                    st.toast("💬 Response received!", icon="✅")
+                                    # st.toast("💬 Response received!", icon="✅")
                                     st.rerun()
                             else:
                                 st.toast("⚠️ Please enter a question first!", icon="⚠️")
