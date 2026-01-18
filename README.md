@@ -4,6 +4,8 @@ An interactive visualization and analysis tool for TripAdvisor hotel reviews usi
 
 ## Atlas Agent Demo
 
+https://github.com/user-attachments/assets/75c8c0f0-cefe-4447-abb4-21fa4c1ade23
+
 ## Atlas Agent
 
 The web app includes an AI analyst that can query and analyze the review dataset through natural language. Select points on the map and ask questions — the agent will execute queries and synthesize findings.
