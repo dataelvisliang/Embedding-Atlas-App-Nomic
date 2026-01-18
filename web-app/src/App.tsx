@@ -194,7 +194,7 @@ function App() {
               <div style={{ display: 'flex', flexDirection: 'column' }}>
                 <h3>
                   <Database size={16} style={{ marginRight: '6px', opacity: 0.7 }} />
-                  Atlas Analyst
+                  Atlas Agent
                 </h3>
                 {selectedPoints.length > 0 && (
                   <span style={{ fontSize: '10px', color: '#60a5fa', fontWeight: 'normal' }}>

@@ -1,4 +1,4 @@
-# Atlas Analyst Architecture
+# Atlas Agent Architecture
 
 This document provides a detailed technical overview of how the Atlas visualization widget works and how the AI agent integrates with it.
 

@@ -6,7 +6,7 @@ An interactive visualization and analysis tool for TripAdvisor hotel reviews usi
 
 **Vercel App:** [embedding-atlas-app.vercel.app](https://embedding-atlas-app.vercel.app) (or your deployed URL)
 
-## Atlas Analyst Agent
+## Atlas Agent
 
 The web app includes an AI analyst that can query and analyze the review dataset through natural language. Select points on the map and ask questions — the agent will execute queries and synthesize findings.
 

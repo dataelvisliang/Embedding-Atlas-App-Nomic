@@ -85,7 +85,7 @@
 }
 
 .chat-window {
-  width: 380px;
+  width: 440px;
   height: 600px;
   max-height: 80vh;
   background: rgba(20, 20, 23, 0.95);
@@ -417,9 +417,9 @@
 }
 
 /* Wide chat window for agent */
-@media (min-width: 500px) {
+@media (min-width: 600px) {
   .chat-window {
-    width: 420px;
+    width: 480px;
   }
 }
 

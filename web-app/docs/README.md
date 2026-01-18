@@ -1,6 +1,6 @@
 # Documentation
 
-Technical documentation for the Atlas Analyst project.
+Technical documentation for the Atlas Agent project.
 
 ## Contents
 

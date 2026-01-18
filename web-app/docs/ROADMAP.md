@@ -1,4 +1,4 @@
-# Atlas Analyst Roadmap
+# Atlas Agent Roadmap
 
 > LLM-powered data analyst for TripAdvisor Review Atlas
 
