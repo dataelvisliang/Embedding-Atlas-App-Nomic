@@ -63,3 +63,90 @@ We removed manual overrides (`window.EMBEDDING_ATLAS_HOME`) that were interferin
 - **Dev Mode**: Labels generate successfully.
 - **Production Build**: Labels continue to work.
 - **Selection Logic**: We fixed a column ID mismatch (`_row_index` vs `__row_index__`), enabling the "Select" feature to pass selected data points to the Chat application.
+
+---
+
+## Issue: Labels Not Working with `npm link` (Local Development)
+
+### Symptoms
+When testing local modifications to `embedding-atlas` using `npm link`:
+- Map renders correctly
+- Highlight feature works (orange circles appear)
+- Labels stuck at "Generating labels..." forever
+- Console shows: `The request id "...\embedding-atlas\...\clustering.worker.js" is outside of Vite serving allow list`
+
+### Root Cause
+When using `npm link` to test a local version of `embedding-atlas`, the linked package files are located outside the web-app directory. Vite's default security settings (`server.fs.allow`) block serving files from outside the project root.
+
+Additionally, the linked packages (`@embedding-atlas/viewer`, `@embedding-atlas/component`, etc.) need to be excluded from Vite's pre-bundling optimization.
+
+### The Fix
+
+#### 1. Allow Vite to Serve Files from Linked Package Directory
+
+```typescript
+// vite.config.ts
+server: {
+  // ... other settings
+  fs: {
+    allow: [
+      '.',
+      'C:/Users/liang/Desktop/ML Notebooks/embedding-atlas'  // Path to linked package
+    ],
+  },
+},
+```
+
+#### 2. Exclude All Linked Packages from Pre-Bundling
+
+```typescript
+// vite.config.ts
+optimizeDeps: {
+  exclude: [
+    "embedding-atlas",
+    "@embedding-atlas/viewer",
+    "@embedding-atlas/component",
+    "@embedding-atlas/table",
+    "@uwdata/mosaic-core",
+    "@duckdb/duckdb-wasm"
+  ],
+},
+```
+
+### npm link Workflow
+
+To test local modifications to `embedding-atlas`:
+
+```bash
+# 1. Build the modified packages
+cd embedding-atlas/packages/utils && npm run package
+cd ../component && npm run package
+cd ../table && npm run package
+cd ../viewer && npx vite build --config vite.config.lib.js
+
+# 2. Link the packages
+cd ../viewer && npm link
+cd ../embedding-atlas && npm link @embedding-atlas/viewer
+cd ../embedding-atlas && npm run build
+cd ../embedding-atlas && npm link
+
+# 3. Use linked packages in web-app
+cd web-app && npm link embedding-atlas
+
+# 4. Clear Vite cache and restart
+rmdir /s /q node_modules\.vite
+npm run dev
+```
+
+### To Restore npm Version
+
+```bash
+cd web-app
+npm unlink embedding-atlas
+npm install
+```
+
+### Result
+- Labels generate correctly with linked packages
+- Highlight feature (programmatic multi-point selection) works
+- Local modifications can be tested without publishing to npm

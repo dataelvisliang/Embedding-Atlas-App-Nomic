@@ -18,6 +18,7 @@ export interface AgentState {
     currentStep: string;
     error: string | null;
     toolsExecuted: string[];
+    highlightIds: number[] | null;  // IDs of points to highlight on the map from tool results
 }
 
 const INITIAL_MESSAGE: Message = {
@@ -44,7 +45,8 @@ export function useAgentChat(coordinator: Coordinator | null) {
         isExecutingTools: false,
         currentStep: '',
         error: null,
-        toolsExecuted: []
+        toolsExecuted: [],
+        highlightIds: null
     });
 
     const toolExecutorRef = useRef<ToolExecutor | null>(null);
@@ -53,6 +55,33 @@ export function useAgentChat(coordinator: Coordinator | null) {
     if (coordinator && !toolExecutorRef.current) {
         toolExecutorRef.current = new ToolExecutor(coordinator);
     }
+
+    /**
+     * Extract point IDs from tool results for map highlighting
+     */
+    const extractHighlightIds = (toolResults: ToolResult[]): number[] => {
+        const ids: number[] = [];
+        for (const result of toolResults) {
+            if (result.result?.reviews && Array.isArray(result.result.reviews)) {
+                // text_search, flexible_search, get_sample all return reviews with id field
+                for (const review of result.result.reviews) {
+                    if (typeof review.id === 'number') {
+                        ids.push(review.id);
+                    }
+                }
+            } else if (result.result?.rows && Array.isArray(result.result.rows)) {
+                // sql_query returns rows - check for __row_index__ or identifier
+                for (const row of result.result.rows) {
+                    if (typeof row.__row_index__ === 'number') {
+                        ids.push(row.__row_index__);
+                    } else if (typeof row.identifier === 'number') {
+                        ids.push(row.identifier);
+                    }
+                }
+            }
+        }
+        return [...new Set(ids)]; // Remove duplicates
+    };
 
     /**
      * Send a message and run the agent loop
@@ -261,6 +290,16 @@ ${reviewsList}
                         console.log(`[Agent] Tool ${toolName} result:`, result);
                     }
 
+                    // Extract IDs from tool results and update highlight
+                    const newHighlightIds = extractHighlightIds(toolResults);
+                    if (newHighlightIds.length > 0) {
+                        console.log(`[Agent] Setting highlight for ${newHighlightIds.length} points from tool results`);
+                        setState(prev => ({
+                            ...prev,
+                            highlightIds: newHighlightIds
+                        }));
+                    }
+
                     // Add the assistant's tool call message to the conversation
                     conversationMessages.push({
                         role: 'assistant',
@@ -326,7 +365,7 @@ ${reviewsList}
     }, [state.messages, state.isLoading, coordinator]);
 
     /**
-     * Clear chat history
+     * Clear chat history and highlight
      */
     const clearChat = useCallback(() => {
         setState({
@@ -335,13 +374,25 @@ ${reviewsList}
             isExecutingTools: false,
             currentStep: '',
             error: null,
-            toolsExecuted: []
+            toolsExecuted: [],
+            highlightIds: null
         });
+    }, []);
+
+    /**
+     * Clear highlight without clearing chat
+     */
+    const clearHighlight = useCallback(() => {
+        setState(prev => ({
+            ...prev,
+            highlightIds: null
+        }));
     }, []);
 
     return {
         ...state,
         sendMessage,
-        clearChat
+        clearChat,
+        clearHighlight
     };
 }

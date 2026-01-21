@@ -28,8 +28,10 @@ function App() {
     isLoading,
     currentStep,
     toolsExecuted,
+    highlightIds,
     sendMessage,
-    clearChat
+    clearChat,
+    clearHighlight
   } = useAgentChat(coordinatorReady);
 
   // Fetch selected points when predicate changes
@@ -153,6 +155,7 @@ function App() {
             embeddingViewConfig={{
               pointSize: 3,
             }}
+            highlight={highlightIds}
             initialState={{ version: "0.0.0", timestamp: Date.now() }}
             onStateChange={(state) => {
               // Only update if predicate actually changed to avoid re-render spam
@@ -196,6 +199,21 @@ function App() {
                 {selectedPoints.length > 0 && (
                   <span style={{ fontSize: '10px', color: '#60a5fa', fontWeight: 'normal' }}>
                     {(selectedPoints as any).totalCount || selectedPoints.length} items selected on map
+                  </span>
+                )}
+                {highlightIds && highlightIds.length > 0 && (
+                  <span
+                    style={{
+                      fontSize: '10px',
+                      color: '#f97316',
+                      fontWeight: 'normal',
+                      cursor: 'pointer',
+                      textDecoration: 'underline'
+                    }}
+                    onClick={clearHighlight}
+                    title="Click to clear highlight"
+                  >
+                    {highlightIds.length} points highlighted (click to clear)
                   </span>
                 )}
               </div>

@@ -10,6 +10,13 @@ export default defineConfig({
       'Cross-Origin-Opener-Policy': 'same-origin',
       'Cross-Origin-Embedder-Policy': 'require-corp',
     },
+    fs: {
+      // Allow serving files from linked packages
+      allow: [
+        '.',
+        'C:/Users/liang/Desktop/ML Notebooks/embedding-atlas'
+      ],
+    },
   },
   plugins: [react()],
   worker: {
@@ -19,6 +26,13 @@ export default defineConfig({
     target: "esnext",
   },
   optimizeDeps: {
-    exclude: ["embedding-atlas", "@uwdata/mosaic-core", "@duckdb/duckdb-wasm"],
+    exclude: [
+      "embedding-atlas",
+      "@embedding-atlas/viewer",
+      "@embedding-atlas/component",
+      "@embedding-atlas/table",
+      "@uwdata/mosaic-core",
+      "@duckdb/duckdb-wasm"
+    ],
   },
 })
