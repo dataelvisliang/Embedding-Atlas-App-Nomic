@@ -1,0 +1,3 @@
+{"query_id":"wine-dev-001","unit_type":"item","unit_id":"review-1","annotator_id":"a1","relevance":2,"theme":"earthy","purity":null,"intent_match":null,"notes":null}
+{"query_id":"wine-dev-001","unit_type":"item","unit_id":"review-2","annotator_id":"a1","relevance":0,"theme":null,"purity":null,"intent_match":null,"notes":null}
+{"query_id":"wine-dev-001","unit_type":"region","unit_id":"r1","annotator_id":"a1","relevance":null,"theme":null,"purity":0.9,"intent_match":0.7,"notes":null}

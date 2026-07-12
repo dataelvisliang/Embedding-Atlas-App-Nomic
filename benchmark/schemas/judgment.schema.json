@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Blind benchmark judgment",
+  "type": "object",
+  "required": ["query_id", "unit_type", "unit_id", "annotator_id"],
+  "properties": {
+    "query_id": {"type": "string"},
+    "unit_type": {"enum": ["item", "region"]},
+    "unit_id": {"type": "string"},
+    "annotator_id": {"type": "string"},
+    "relevance": {"type": ["integer", "null"], "minimum": 0, "maximum": 2},
+    "theme": {"type": ["string", "null"]},
+    "purity": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+    "intent_match": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+    "notes": {"type": ["string", "null"]}
+  }
+}

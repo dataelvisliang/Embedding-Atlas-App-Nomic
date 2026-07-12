@@ -33,6 +33,7 @@ function App() {
     isLoading,
     currentStep,
     toolsExecuted,
+    searchPolicy,
     highlightIds,
     savedCategories,
     sendMessage,
@@ -188,20 +189,21 @@ function App() {
   };
 
   const handleDownloadChat = () => {
-    const mdContent = messages.map(m => {
+    let mdContent = messages.map(m => {
       const role = m.role === 'user' ? '**User**' : '**AI Sommelier**';
       
       // Expand {{Category}} placeholders with actual review data
       let content = m.content;
       const categoryPattern = /\{\{([^}]+)\}\}/g;
       content = content.replace(categoryPattern, (match, categoryName) => {
-        const categoryData = savedCategories.get(categoryName) as any;
-        if (!categoryData?.reviews) {
+        const categoryData = savedCategories.get(categoryName) as any[] | undefined;
+        const data = categoryData?.[0];
+        if (!data?.reviews) {
           return match; // Keep original if no data found
         }
         
         // Format reviews as markdown table
-        const reviews = categoryData.reviews as any[];
+        const reviews = data.reviews as any[];
         let table = `\n\n**${categoryName}** (${reviews.length} wines)\n\n`;
         table += `| Wine | Points | Price | Description |\n`;
         table += `|------|--------|-------|-------------|\n`;
@@ -219,6 +221,14 @@ function App() {
       
       return `${role}:\n${content}\n\n---\n`;
     }).join('\n');
+
+    if (searchPolicy) {
+      const benchmarkExport = {
+        ...searchPolicy,
+        saved_categories: Object.fromEntries(savedCategories)
+      };
+      mdContent += `\n\n## Search policy trajectory\n\n\`\`\`json\n${JSON.stringify(benchmarkExport, null, 2)}\n\`\`\`\n`;
+    }
     
     const blob = new Blob([mdContent], { type: 'text/markdown' });
     const url = URL.createObjectURL(blob);
@@ -234,9 +244,12 @@ function App() {
   // Tool icon mapping
   const getToolIcon = (toolName: string) => {
     switch (toolName) {
-      case 'sql_query': return <Database size={12} />;
-      case 'text_search': return <Search size={12} />;
-      case 'get_stats': return <BarChart3 size={12} />;
+      case 'search_reviews': return <Search size={12} />;
+      case 'scan_regions':
+      case 'inspect_regions':
+      case 'refine_region': return <Database size={12} />;
+      case 'compare_regions': return <BarChart3 size={12} />;
+      case 'save_results': return <Download size={12} />;
       default: return <Database size={12} />;
     }
   };
@@ -405,6 +418,12 @@ function App() {
                                     <span style={{ marginRight: '12px' }}>Avg Points: {data.avg_points || data.avg_rating}</span>
                                     <span>Samples: {reviews.length}</span>
                                   </div>
+                                  {(typeof data.purity === 'number' || typeof data.intent_match === 'number') && (
+                                    <div style={{ fontSize: '12px', opacity: 0.8, marginBottom: '12px' }}>
+                                      <span style={{ marginRight: '12px' }}>Purity: {typeof data.purity === 'number' ? `${Math.round(data.purity * 100)}%` : 'N/A'}</span>
+                                      <span>Intent match: {typeof data.intent_match === 'number' ? `${Math.round(data.intent_match * 100)}%` : 'N/A'}</span>
+                                    </div>
+                                  )}
                                   {data.themes && data.themes.length > 0 && (
                                     <div style={{ fontSize: '13px', marginBottom: '12px', opacity: 0.8 }}>
                                       <strong>Themes:</strong> {data.themes.join(', ')}
@@ -499,6 +518,12 @@ function App() {
                           {tool.replace('_', ' ')}
                         </span>
                       ))}
+                    </div>
+                  )}
+                  {searchPolicy && (
+                    <div className="step-indicator" style={{ marginTop: '6px' }}>
+                      Policy: {searchPolicy.inspected_region_count} probes | {searchPolicy.accepted_region_count}/{searchPolicy.objective.target_accepted_regions} accepted | {searchPolicy.relevant_themes.length} relevant themes | {searchPolicy.frontier.length} frontier | {searchPolicy.remaining.toolCalls} actions | {searchPolicy.remaining.modelTokens.toLocaleString()} tokens left | {(searchPolicy.elapsed_ms / 1000).toFixed(1)}s
+                      {searchPolicy.must_stop && ` | stopping: ${searchPolicy.stop_reason}`}
                     </div>
                   )}
                 </div>

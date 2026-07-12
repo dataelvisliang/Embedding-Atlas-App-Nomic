@@ -1,0 +1,13 @@
+{
+  "benchmark_id": "wine-par-v1",
+  "frozen_on": "2026-07-11",
+  "hash_algorithm": "sha256",
+  "files": {
+    "benchmark/queries/queries_v1.jsonl": "abc98f1e7ab497c07ac3288ea2c83c2b2cd38f687972384d12f1ac2ff9c63507",
+    "benchmark/configs/benchmark_v1.json": "c1b03ecb80d5f3b4725029f4be6108f7e67060a8bb113f4ba746c231742c60d3",
+    "benchmark/configs/systems.json": "b3453ac5ba04a6b99a7052c45d08e05ef351dfd1660165f64c043579288fa62b",
+    "benchmark/configs/par_v1.json": "f4e9cc51bb42c7aa13f799e387cf7fdc7a334f896e089db363d81bfc59871b64",
+    "benchmark/schemas/run.schema.json": "655f55a796108244daa698f945a4b9d4375c83afa383800b4e907b0cd0f8f4be",
+    "benchmark/schemas/judgment.schema.json": "b4c526cdc6d790e8cbaad6d28acc14fab7db4ba055b4d4b34c59928d6dcc80ab"
+  }
+}

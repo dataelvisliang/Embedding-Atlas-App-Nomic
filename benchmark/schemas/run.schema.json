@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Benchmark run record",
+  "type": "object",
+  "required": ["query_id", "system_id", "seed", "results", "cost"],
+  "properties": {
+    "query_id": {"type": "string"},
+    "system_id": {"type": "string"},
+    "seed": {"type": "integer"},
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["review_id", "rank"],
+        "properties": {
+          "review_id": {"type": "integer"},
+          "rank": {"type": "integer", "minimum": 1},
+          "score": {"type": ["number", "null"]},
+          "region_id": {"type": ["string", "null"]},
+          "theme": {"type": ["string", "null"]},
+          "title": {"type": ["string", "null"]},
+          "description": {"type": ["string", "null"]}
+        }
+      }
+    },
+    "regions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["region_id", "purity", "intent_match"],
+        "properties": {
+          "region_id": {"type": "string"},
+          "purity": {"type": "number", "minimum": 0, "maximum": 1},
+          "intent_match": {"type": "number", "minimum": 0, "maximum": 1},
+          "utility": {"type": ["number", "null"]},
+          "recommended_action": {"type": ["string", "null"]},
+          "review_ids": {"type": "array", "items": {"type": "integer"}}
+        }
+      }
+    },
+    "cost": {
+      "type": "object",
+      "required": ["latency_ms", "total_tokens", "tool_calls", "probes"],
+      "properties": {
+        "latency_ms": {"type": "number", "minimum": 0},
+        "total_tokens": {"type": "number", "minimum": 0},
+        "tool_calls": {"type": "integer", "minimum": 0},
+        "probes": {"type": "integer", "minimum": 0}
+      }
+    },
+    "stop_reason": {"type": ["string", "null"]},
+    "trajectory": {"type": ["array", "null"]}
+  }
+}

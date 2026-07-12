@@ -14,17 +14,19 @@ The web app features a sophisticated **Multi-Agent Architecture** that enables a
 | ------------------- | ----------------------------------------------------------------------------------------- |
 | **Sommelier Agent** | **Orchestrator Agent** that understands varietals, regions, and price points              |
 | **Flavor Analyzer** | **Analyzer Agent** that extracts flavor notes, acidity, tannins, and finish from clusters |
-| **Agentic Search**  | Autonomous exploration loop: Scan Regions → Analyze Flavors → Select Best Wines           |
+| **Agentic Search**  | Projection-guided loop: coarse grid scan → parallel circular probes → refine/compare → save |
 | **Vintage Memory**  | Bookmarks interesting wines with **Category Cards** (e.g., "Earthy Tuscan Reds")          |
 | **Interactive Map** | 2D semantic map of 130k wines where similar taste profiles are clustered together         |
 
 ### How It Works
 
-1.  **Global Scan**: The Sommelier scans the map for dense clusters of unrelated wines or specific varietals.
-2.  **Delegated Analysis**: It delegates specific clusters to the **Analyzer Agent** to extract flavor profiles.
-3.  **Synthesis**: The Analyzer returns a structured summary (tasting notes, quality sentiment, representative quotes).
-4.  **Curation**: Relevant wines are saved as curated collections in the chat.
-5.  **Presentation**: The final answer displays interactive **Category Cards** allowing you to browse specific bottles.
+1.  **Coarse Scan**: The Sommelier finds dense grid cells under optional lexical and metadata constraints.
+2.  **Parallel Circular Probes**: It places several true circular probes in one action and delegates their samples to the **Analyzer Agent**.
+3.  **Adaptive Traversal**: Based on density, themes, and projection agreement, it rejects, compares, or refines regions.
+4.  **High-D Diagnostic**: Stored embedding-neighbor data estimates whether high-dimensional neighbors remain inside each 2D probe.
+5.  **Curation**: Verified reviews are saved separately from retrieval and displayed as interactive Category Cards.
+
+The projection is treated as a candidate-generation space, not semantic ground truth. See [Projection-Guided Agentic Search](web-app/docs/PROJECTION_AGENT_SEARCH.md) for tool boundaries, geometry, stopping behavior, and evaluation hooks.
 
 ### Architecture
 
@@ -52,9 +54,9 @@ flowchart TB
 
     Chat --> Orchestrator
     Orchestrator --> Tools
-    Tools -->|"analyze_cluster"| Analyzer
+    Tools -->|"inspect_regions"| Analyzer
     Analyzer -->|"summary"| Orchestrator
-    Orchestrator -->|"save_reviews"| Memory
+    Orchestrator -->|"save_results"| Memory
     Orchestrator -->|"final answer"| Chat
 ```
 
@@ -65,14 +67,12 @@ The orchestrator agent that coordinates exploration and delegates analysis tasks
 ```mermaid
 flowchart LR
     subgraph Tools["Available Tools"]
-        SQL["sql_query<br/>DuckDB Analytics"]
-        Text["text_search<br/>Keyword Search"]
-        Flex["flexible_search<br/>Multi-term AND/OR"]
-        Stats["get_stats<br/>Dataset Overview"]
-        Sample["get_sample<br/>Random Reviews"]
-        Topics["get_topics<br/>Map Labels"]
-        Analyze["analyze_cluster<br/>→ Delegates to Sub-Agent"]
-        Save["save_reviews<br/>→ Client Memory"]
+        Search["search_reviews<br/>Known constraints"]
+        Scan["scan_regions<br/>Coarse candidates"]
+        Inspect["inspect_regions<br/>Parallel circles → Analyzer"]
+        Refine["refine_region<br/>Zoom into a circle"]
+        Compare["compare_regions<br/>Contrast circles"]
+        Save["save_results<br/>Client memory"]
     end
 
     Agent["Sommelier Agent<br/>/api/agent"] --> Tools
@@ -123,6 +123,10 @@ The project includes a robust Python pipeline to process the raw CSV into a visu
 1.  `1_generate_embeddings_OpenRouter.py` - Generate embeddings from wine descriptions using Nomic API.
 2.  `2_reduce_dimensions.py` - Dimensionality reduction (UMAP) to project 768d vectors to 2D.
 3.  `regenerate_static_export.py` - Packages the processed `winemag_projected.parquet` for the web app.
+
+## Benchmark
+
+The frozen `wine-par-v1` benchmark contains 30 stratified queries, seven system baselines, blind pooled-judgment protocols, trajectory conversion, and dependency-free evaluation for retrieval quality, thematic exploration, cost, and purity/intent calibration. See the [benchmark README](benchmark/README.md) and [runbook](benchmark/RUNBOOK.md).
 
 ## License
 

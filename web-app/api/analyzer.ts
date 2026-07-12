@@ -9,22 +9,40 @@ Your task is to analyze a set of wine reviews and extract:
 2. **Quality Perception**: Overall impression of quality (Excellent, Good, Mediocre)
 3. **Flavor Notes**: List of 2-5 specific flavor notes or characteristics found in the reviews (e.g., "cherry", "oak", "earthy", "high tannins")
 4. **Top Quotes**: Extract 2-3 representative short quotes (max 100 chars each) that best describe the wine's character
+5. **Semantic Purity**: A score from 0.0 to 1.0 estimating the share of sampled reviews that support one dominant coherent wine theme. A region can be pure even when it is irrelevant to the user's intent.
+6. **Intent Match**: A score from 0.0 to 1.0 estimating how strongly the sampled region satisfies the supplied user intent and constraints. A region can match weakly even when internally pure.
+
+Calibration:
+- 0.90-1.00: nearly all sampled evidence supports the criterion
+- 0.70-0.89: strong majority support
+- 0.40-0.69: mixed or partial support
+- 0.10-0.39: weak support
+- 0.00-0.09: absent or contradicted
 
 Output your analysis as JSON:
 {
   "category": "...",
   "sentiment": "Excellent|Good|Mediocre",
   "themes": ["note1", "note2", ...],
-  "quotes": ["quote1", "quote2", "quote3"]
+  "quotes": ["quote1", "quote2", "quote3"],
+  "purity": 0.0,
+  "purity_rationale": "one short evidence-based sentence",
+  "intent_match": 0.0,
+  "intent_match_rationale": "one short evidence-based sentence",
+  "outlier_count": 0
 }
 
-Be precise and data-driven. The category should be informative.`;
+Score the supplied reviews only. Do not infer from coordinates or density. Be precise and data-driven. The category should be informative.`;
 
 interface AnalyzerRequest {
-    bin_x: number;
-    bin_y: number;
-    bin_size?: number;
-    limit?: number;
+    region: {
+        id?: string;
+        center_x: number;
+        center_y: number;
+        radius: number;
+    };
+    intent: string;
+    reviews: any[];
 }
 
 interface AnalyzerResponse {
@@ -35,9 +53,21 @@ interface AnalyzerResponse {
     count: number;
     avg_points: number;
     review_ids: number[];
-    bin_x: number;
-    bin_y: number;
+    region_id?: string;
+    center_x: number;
+    center_y: number;
+    radius: number;
+    purity: number;
+    purity_rationale: string;
+    intent_match: number;
+    intent_match_rationale: string;
+    outlier_count: number;
 }
+
+const normalizedScore = (value: unknown, fallback = 0.5): number => {
+    const score = Number(value);
+    return Number.isFinite(score) ? Math.round(Math.min(1, Math.max(0, score)) * 1000) / 1000 : fallback;
+};
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
     // CORS headers
@@ -61,17 +91,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     try {
-        const { bin_x, bin_y, bin_size = 1.0, limit = 5 }: AnalyzerRequest = req.body;
+        const { region, reviews, intent }: AnalyzerRequest = req.body;
 
-        if (typeof bin_x !== 'number' || typeof bin_y !== 'number') {
-            return res.status(400).json({ error: 'Invalid request: bin_x and bin_y are required' });
+        if (!region || typeof region.center_x !== 'number' || typeof region.center_y !== 'number' || typeof region.radius !== 'number') {
+            return res.status(400).json({ error: 'Invalid request: a circular region with center_x, center_y, and radius is required' });
         }
 
         // This would normally fetch from DuckDB, but since we're server-side,
         // we need to receive the reviews data from the client
         // For now, we'll expect the client to send reviews directly
-        const reviews = req.body.reviews;
-
         if (!reviews || !Array.isArray(reviews)) {
             return res.status(400).json({
                 error: 'Reviews array required. Please send reviews data in request body.'
@@ -87,8 +115,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
                 count: 0,
                 avg_points: 0,
                 review_ids: [],
-                bin_x,
-                bin_y
+                region_id: region.id,
+                center_x: region.center_x,
+                center_y: region.center_y,
+                radius: region.radius,
+                purity: 0,
+                purity_rationale: 'The circle contains no reviews.',
+                intent_match: 0,
+                intent_match_rationale: 'No evidence is available for intent matching.',
+                outlier_count: 0
             });
         }
 
@@ -104,7 +139,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         ).join('\n\n');
 
         // Call Analyzer Agent (LLM)
-        console.log(`[Analyzer] Analyzing ${reviews.length} reviews at bin (${bin_x}, ${bin_y})`);
+        console.log(`[Analyzer] Analyzing ${reviews.length} reviews in circle (${region.center_x}, ${region.center_y}, r=${region.radius})`);
 
         const llmResponse = await fetch(OPENROUTER_API_URL, {
             method: 'POST',
@@ -118,10 +153,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
                 model,
                 messages: [
                     { role: 'system', content: ANALYZER_SYSTEM_PROMPT },
-                    { role: 'user', content: `Analyze these ${reviews.length} reviews:\n\n${reviewsText}` }
+                    { role: 'user', content: `User intent: ${String(intent || 'Open-ended wine theme discovery').slice(0, 500)}\n\nAnalyze these ${reviews.length} reviews and score both semantic purity and intent match independently:\n\n${reviewsText}` }
                 ],
                 temperature: 0.3,  // Low temp for consistent analysis
-                max_tokens: 500
+                max_tokens: 700
             })
         });
 
@@ -164,14 +199,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             const jsonMatch = content.match(/```json\n([\s\S]+?)\n```/) || content.match(/\{[\s\S]+\}/);
             const jsonStr = jsonMatch ? (jsonMatch[1] || jsonMatch[0]) : content;
             analysis = JSON.parse(jsonStr);
-        } catch (e) {
+        } catch {
             console.error('[Analyzer] Failed to parse LLM JSON:', content);
             // Fallback: create a basic analysis
             analysis = {
                 category: 'General Wines',
                 sentiment: avg_points >= 88 ? 'Excellent' : 'Good',
                 themes: ['Various Styles'],
-                quotes: []
+                quotes: [],
+                purity: 0.5,
+                purity_rationale: 'Structured analysis was unavailable; neutral fallback used.',
+                intent_match: 0.5,
+                intent_match_rationale: 'Structured analysis was unavailable; neutral fallback used.',
+                outlier_count: 0
             };
         }
 
@@ -183,12 +223,24 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             count: reviews.length,
             avg_points: Math.round(avg_points * 10) / 10,
             review_ids: reviews.map((r: any) => r.id || r.__row_index__).filter((id: any) => id !== undefined),
-            bin_x,
-            bin_y
+            region_id: region.id,
+            center_x: region.center_x,
+            center_y: region.center_y,
+            radius: region.radius,
+            purity: normalizedScore(analysis.purity),
+            purity_rationale: String(analysis.purity_rationale || 'No rationale returned.'),
+            intent_match: normalizedScore(analysis.intent_match),
+            intent_match_rationale: String(analysis.intent_match_rationale || 'No rationale returned.'),
+            outlier_count: Math.max(0, Math.min(reviews.length, Math.round(Number(analysis.outlier_count) || 0)))
+        };
+
+        const responseWithUsage = {
+            ...response,
+            analyzer_usage: llmData.usage
         };
 
         console.log(`[Analyzer] Analysis complete: ${response.category} (${response.sentiment})`);
-        return res.status(200).json(response);
+        return res.status(200).json(responseWithUsage);
 
     } catch (error) {
         console.error('[Analyzer] Error:', error);

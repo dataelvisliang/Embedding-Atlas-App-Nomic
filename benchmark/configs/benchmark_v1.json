@@ -1,0 +1,14 @@
+{
+  "benchmark_id": "wine-par-v1",
+  "dataset": "Wine Magazine 130k reviews",
+  "query_file": "benchmark/queries/queries_v1.jsonl",
+  "seeds": [17, 29, 43],
+  "cutoffs": [5, 10, 20],
+  "pool_depth": 20,
+  "minimum_annotators_per_item": 2,
+  "relevance_scale": [0, 1, 2],
+  "region_score_range": [0.0, 1.0],
+  "frozen_split": "test",
+  "primary_metrics": ["ndcg@10", "precision@10", "theme_coverage", "success_rate", "tokens", "latency_ms"],
+  "calibration_metrics": ["purity_mae", "intent_match_mae", "purity_spearman", "intent_match_spearman"]
+}

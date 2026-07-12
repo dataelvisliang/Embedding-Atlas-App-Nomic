@@ -1,0 +1,34 @@
+{
+  "system_id": "par_v1",
+  "label": "Projection-Augmented Agent Retrieval v1",
+  "retrieval": ["structured", "projection_xy", "stored_high_d_neighbors"],
+  "agent": true,
+  "human_map_interaction": false,
+  "tools": ["search_reviews", "scan_regions", "inspect_regions", "refine_region", "compare_regions", "save_results"],
+  "limits": {
+    "tool_calls": 18,
+    "scans": 2,
+    "structured_searches": 4,
+    "inspected_circles": 24,
+    "refinements": 5,
+    "comparisons": 4,
+    "saved_categories": 8,
+    "model_tokens": 80000,
+    "wall_clock_ms": 120000
+  },
+  "decision_thresholds": {
+    "accept_intent_match": 0.75,
+    "accept_purity": 0.70,
+    "reject_intent_match": 0.45,
+    "minimum_frontier_utility": 0.15,
+    "semantic_no_progress_rounds": 2
+  },
+  "utility_weights": {
+    "intent_match": 0.45,
+    "purity": 0.20,
+    "novelty": 0.15,
+    "coverage_gain": 0.10,
+    "confidence": 0.10,
+    "fixed_search_cost": -0.05
+  }
+}

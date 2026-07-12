@@ -2,6 +2,8 @@ import { useState, useCallback, useRef } from 'react';
 import { Coordinator } from '@uwdata/mosaic-core';
 import { ToolExecutor } from '../tools/toolExecutor';
 import type { ToolCall, ToolResult } from '../tools/toolExecutor';
+import { SearchPolicy } from '../agent/searchPolicy';
+import type { SearchPolicySnapshot } from '../agent/searchPolicy';
 
 export interface Message {
     role: 'user' | 'assistant' | 'tool';
@@ -25,19 +27,20 @@ export interface AgentState {
     toolsExecuted: string[];
     highlightIds: number[] | null;  // IDs of points to highlight on the map from tool results
     savedCategories: Map<string, any[]>;  // Category-based memory: category name -> array of review objects
-    analyzeClusterCache: ToolResult[];  // Cache of all analyze_cluster results across rounds
+    inspectedRegionsCache: any[];  // Region analyses retained so save_results can build UI cards
+    searchPolicy: SearchPolicySnapshot | null; // Reproducible trajectory, budgets, and stop state
 }
 
 const INITIAL_MESSAGE: Message = {
     role: 'assistant',
     content: `Hello! I'm your AI Sommelier and Wine Data Analyst.
 
-I can help you explore the wine reviews dataset by:
+I can help you explore the wine review projection by:
 
-- **Searching** for wines with specific notes (blackberry, oak, tannins, etc.)
-- **Analyzing** scores, price trends, and regional characteristics
-- **Finding** examples of high-scoring or good value wines
-- **Answering** questions about varietals and styles
+- **Scanning** the semantic landscape for dense candidate regions
+- **Probing several circles in parallel** to discover themes
+- **Refining and comparing** promising regions
+- **Searching** directly when you already know the flavor, grape, country, or budget
 
 Try asking: "Find me good value reds under $20" or "What are the common flavors in Tuscan wines?"`
 };
@@ -56,12 +59,13 @@ export function useAgentChat(coordinator: Coordinator | null) {
         toolsExecuted: [],
         highlightIds: null,
         savedCategories: new Map(),
-        analyzeClusterCache: [] // Store all analyze_cluster results across rounds
+        inspectedRegionsCache: [],
+        searchPolicy: null
     });
 
     const toolExecutorRef = useRef<ToolExecutor | null>(null);
     const abortControllerRef = useRef<AbortController | null>(null);
-    const analyzeClusterCacheRef = useRef<ToolResult[]>([]);  // Sync cache for analyze_cluster results
+    const inspectedRegionsCacheRef = useRef<any[]>([]);
 
     // Initialize tool executor when coordinator is available
     if (coordinator && !toolExecutorRef.current) {
@@ -75,19 +79,18 @@ export function useAgentChat(coordinator: Coordinator | null) {
         const ids: number[] = [];
         for (const result of toolResults) {
             if (result.result?.reviews && Array.isArray(result.result.reviews)) {
-                // text_search, flexible_search, get_sample all return reviews with id field
                 for (const review of result.result.reviews) {
                     if (typeof review.id === 'number') {
                         ids.push(review.id);
                     }
                 }
-            } else if (result.result?.rows && Array.isArray(result.result.rows)) {
-                // sql_query returns rows - check for __row_index__ or identifier
-                for (const row of result.result.rows) {
-                    if (typeof row.__row_index__ === 'number') {
-                        ids.push(row.__row_index__);
-                    } else if (typeof row.identifier === 'number') {
-                        ids.push(row.identifier);
+            }
+            if (result.result?.regions && Array.isArray(result.result.regions)) {
+                for (const region of result.result.regions) {
+                    if (Array.isArray(region.reviews)) {
+                        for (const review of region.reviews) {
+                            if (typeof review.id === 'number') ids.push(review.id);
+                        }
                     }
                 }
             }
@@ -204,11 +207,6 @@ export function useAgentChat(coordinator: Coordinator | null) {
                     ? `(Showing ${reviewsIncluded} of ${totalSelected} selected reviews in context)`
                     : '';
 
-                // Include the SQL predicate so LLM can query the full selection
-                const predicateInfo = selectionPredicate
-                    ? `\n**SQL Filter for Tools:** To query ALL ${totalSelected} selected reviews, add this WHERE clause: \`${selectionPredicate}\``
-                    : '';
-
                 const selectionContext = `
 **IMPORTANT: The user has selected ${totalSelected} reviews on the visualization.**
 They are asking about THIS SPECIFIC SUBSET, not the entire dataset.
@@ -219,22 +217,14 @@ They are asking about THIS SPECIFIC SUBSET, not the entire dataset.
 - Average score (of shown): ${avgScore}
 - Score distribution (of shown): ${distributionText || 'N/A'}
 ${truncatedNote}
-${predicateInfo}
-
 **Selected Reviews:**
 ${reviewsList}
 
 ---
 **Instructions:**
 1. Answer based on the selected reviews shown above
-2. You CAN USE TOOLS (sql_query, text_search) to query the FULL selection of ${totalSelected} reviews:
-   - For sql_query: Include the WHERE clause shown above to filter to selected reviews
-   - Example: \`SELECT AVG(points) FROM reviews WHERE ${selectionPredicate || '[predicate]'}\`
-3. USE tools when the user asks for:
-   - Exact counts, averages, or statistics across all selected reviews
-   - Keyword searches within the selection
-   - Detailed breakdowns that need all ${totalSelected} reviews
-4. The ${reviewsIncluded} reviews shown above are a representative sample for topic/theme analysis
+2. Treat the ${reviewsIncluded} reviews shown above as the available representative sample of that selection.
+3. Do not run a global spatial scan unless the user explicitly asks to compare the selection with the full map.
 `;
 
                 // Prepend selection context to the user's message
@@ -244,7 +234,8 @@ ${reviewsList}
                 console.log("[AgentChat] Selection context built with", reviewsIncluded, "reviews (~" + Math.round(totalChars / 4) + " tokens), total selected:", totalSelected);
             }
 
-            const maxIterations = 30; // Agentic search allows for deeper exploration
+            const searchPolicy = new SearchPolicy({}, userMessage);
+            const maxIterations = 22; // Policy budgets normally stop exploration before this safety ceiling.
             let iteration = 0;
             const allToolsExecuted: string[] = [];
 
@@ -259,12 +250,19 @@ ${reviewsList}
 
                 // If we're approaching the limit, hint the LLM to wrap up
                 // Give agent 3 steps to respond (inject at step 27, 28, 29)
-                let messagesToSend = conversationMessages;
+                const policySnapshot = searchPolicy.snapshot();
+                let messagesToSend = [
+                    ...conversationMessages,
+                    {
+                        role: 'system',
+                        content: `SEARCH_POLICY_STATE (controller-enforced):\n${JSON.stringify(policySnapshot)}\nRespect remaining budgets. If must_stop=true, call only save_results if needed and then provide the final answer.`
+                    } as any
+                ];
                 if (iteration >= maxIterations - 3) {
                     const stepsRemaining = maxIterations - iteration;
                     // Add a system hint to stop using tools and give final answer
                     messagesToSend = [
-                        ...conversationMessages,
+                        ...messagesToSend,
                         {
                             role: 'system',
                             content: `IMPORTANT: You are approaching the step limit (${stepsRemaining} step${stepsRemaining > 1 ? 's' : ''} remaining). Please finalize your findings and provide the final comprehensive answer now. Do NOT call any more tools unless absolutely critical.`
@@ -286,6 +284,7 @@ ${reviewsList}
 
                 // Parse the JSON response
                 const data = await response.json();
+                searchPolicy.recordModelUsage(data.usage);
 
                 // If the LLM wants to call tools
                 if (data.type === 'tool_calls' && data.tool_calls && data.tool_calls.length > 0) {
@@ -307,60 +306,78 @@ ${reviewsList}
                             toolsExecuted: [...allToolsExecuted]
                         }));
 
-                        const result = await toolExecutorRef.current!.execute(toolCall);
+                        const decision = searchPolicy.evaluate(toolCall as ToolCall);
+                        if (decision.blockedResult) {
+                            toolResults.push(decision.blockedResult);
+                            setState(prev => ({ ...prev, searchPolicy: searchPolicy.snapshot() }));
+                            console.log(`[Agent] Policy blocked ${toolName}:`, decision.blockedResult.result);
+                            continue;
+                        }
+
+                        const result = await toolExecutorRef.current!.execute(decision.call!);
+                        searchPolicy.record(result);
                         toolResults.push(result);
 
-                        // Cache analyze_cluster results for later save_reviews calls
-                        if (result.name === 'analyze_cluster' && result.result?.review_ids) {
-                            analyzeClusterCacheRef.current.push(result);  // Sync update via ref
-                            console.log(`[Agent] Cached analyze_cluster result, total cached:`, analyzeClusterCacheRef.current.length);
+                        setState(prev => ({ ...prev, searchPolicy: searchPolicy.snapshot() }));
+
+                        // Cache each inspected circle so a later save_results call can build rich cards.
+                        if (result.name === 'inspect_regions' && Array.isArray(result.result?.regions)) {
+                            inspectedRegionsCacheRef.current.push(...result.result.regions);
+                            console.log('[Agent] Cached inspected regions:', inspectedRegionsCacheRef.current.length);
+                        }
+                        if (result.name === 'search_reviews' && Array.isArray(result.result?.reviews)) {
+                            const reviews = result.result.reviews;
+                            inspectedRegionsCacheRef.current.push({
+                                category: 'Structured search', sentiment: 'N/A', themes: [], quotes: [],
+                                review_ids: reviews.map((review: any) => review.id), reviews
+                            });
                         }
 
                         console.log(`[Agent] Tool ${toolName} result:`, result);
                     }
 
-                    // Handle save_reviews tool: extract reviews from analyze_cluster results
+                    // save_results is deliberately separate from retrieval; resolve its IDs against prior probes.
                     for (const toolResult of toolResults) {
-                        if (toolResult.name === 'save_reviews' && toolResult.result?.saved) {
+                        if (toolResult.name === 'save_results' && toolResult.result?.saved) {
                             const { review_ids, category } = toolResult.result;
-
-                            // Find the most recent analyze_cluster result that contains these IDs
-                            let categoryData: any = null;
-                            
-                            // Check both current toolResults AND cached analyze_cluster results
-                            const allAnalyzeResults = [
-                                ...toolResults.filter(t => t.name === 'analyze_cluster'),
-                                ...analyzeClusterCacheRef.current
-                            ];
-
-                            // Check all analyze_cluster results (current + cached)
-                            for (const prevResult of allAnalyzeResults) {
-                                if (prevResult.name === 'analyze_cluster' && prevResult.result?.review_ids) {
-                                    const analyzerData = prevResult.result;
-                                    const analyzerReviewIds = analyzerData.review_ids;
-                                    const matchingIds = review_ids.filter((id: number) =>
-                                        analyzerReviewIds.includes(id)
-                                    );
-
-                                    if (matchingIds.length > 0) {
-                                        // Extract full review data if available
-                                        categoryData = {
-                                            category: category,
-                                            analyzer_category: analyzerData.category,
-                                            sentiment: analyzerData.sentiment,
-                                            themes: analyzerData.themes,
-                                            quotes: analyzerData.quotes,
-                                            avg_points: analyzerData.avg_points,
-                                            review_ids: matchingIds,
-                                            reviews: analyzerData.reviews || [],
-                                            bin_x: analyzerData.bin_x,
-                                            bin_y: analyzerData.bin_y,
-                                            count: matchingIds.length
-                                        };
-                                        break;
-                                    }
+                            const matchedRegions: any[] = [];
+                            const matchedReviews: any[] = [];
+                            for (const region of inspectedRegionsCacheRef.current) {
+                                const matchingIds = review_ids.filter((id: number) => region.review_ids?.includes(id));
+                                if (matchingIds.length > 0) {
+                                    matchedRegions.push(region);
+                                    matchedReviews.push(...(region.reviews || []).filter((review: any) => matchingIds.includes(review.id)));
                                 }
                             }
+
+                            const uniqueReviews = [...new Map(matchedReviews.map(review => [review.id, review])).values()];
+                            const averageMetric = (key: string) => {
+                                const values = matchedRegions.map(region => Number(region[key])).filter(Number.isFinite);
+                                return values.length ? Math.round((values.reduce((sum, value) => sum + value, 0) / values.length) * 1000) / 1000 : null;
+                            };
+                            const categoryData = matchedRegions.length ? {
+                                category,
+                                analyzer_category: matchedRegions.map(region => region.category).filter(Boolean).join(' + '),
+                                sentiment: matchedRegions.map(region => region.sentiment).filter(Boolean).join(', '),
+                                themes: [...new Set(matchedRegions.flatMap(region => region.themes || []))],
+                                quotes: [...new Set(matchedRegions.flatMap(region => region.quotes || []))],
+                                avg_points: matchedRegions[0].avg_points,
+                                intent: matchedRegions[0].intent,
+                                purity: averageMetric('purity'),
+                                intent_match: averageMetric('intent_match'),
+                                purity_rationales: matchedRegions.map(region => region.purity_rationale).filter(Boolean),
+                                intent_match_rationales: matchedRegions.map(region => region.intent_match_rationale).filter(Boolean),
+                                review_ids: uniqueReviews.map(review => review.id),
+                                reviews: uniqueReviews,
+                                regions: matchedRegions.map(region => ({
+                                    id: region.id, center_x: region.center_x, center_y: region.center_y,
+                                    radius: region.radius,
+                                    purity: region.purity,
+                                    intent_match: region.intent_match,
+                                    projection_agreement: region.projection_agreement
+                                })),
+                                count: uniqueReviews.length
+                            } : null;
 
                             // Update savedCategories state
                             if (categoryData) {
@@ -418,8 +435,11 @@ ${reviewsList}
                     isLoading: false,
                     isExecutingTools: false,
                     currentStep: '',
-                    toolsExecuted: allToolsExecuted
+                    toolsExecuted: allToolsExecuted,
+                    searchPolicy: searchPolicy.snapshot()
                 }));
+
+                console.log('[Agent] Final search policy and trajectory:', searchPolicy.snapshot());
 
                 return;
             }
@@ -479,9 +499,10 @@ ${reviewsList}
             toolsExecuted: [],
             highlightIds: null,
             savedCategories: new Map(),
-            analyzeClusterCache: []
+            inspectedRegionsCache: [],
+            searchPolicy: null
         });
-        analyzeClusterCacheRef.current = [];  // Also clear the ref cache
+        inspectedRegionsCacheRef.current = [];
     }, []);
 
     /**

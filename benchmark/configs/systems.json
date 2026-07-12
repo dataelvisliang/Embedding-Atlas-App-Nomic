@@ -1,0 +1,9 @@
+[
+  {"system_id":"keyword","label":"Keyword / lexical retrieval","agent":false,"uses_xy":false,"uses_high_d":false},
+  {"system_id":"ann","label":"High-dimensional embedding ANN","agent":false,"uses_xy":false,"uses_high_d":true},
+  {"system_id":"xy_static","label":"Static XY circle retrieval","agent":false,"uses_xy":true,"uses_high_d":false},
+  {"system_id":"hybrid_static","label":"ANN + metadata hybrid","agent":false,"uses_xy":false,"uses_high_d":true},
+  {"system_id":"agent_ann","label":"Agent with ANN, no XY access","agent":true,"uses_xy":false,"uses_high_d":true},
+  {"system_id":"agent_xy","label":"Agent with XY, no high-D diagnostic","agent":true,"uses_xy":true,"uses_high_d":false},
+  {"system_id":"par_v1","label":"Full projection-augmented agent","agent":true,"uses_xy":true,"uses_high_d":true}
+]

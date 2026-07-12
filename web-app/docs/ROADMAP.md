@@ -1,172 +1,43 @@
-# Atlas Agent Roadmap
+# Wine Atlas Agent Roadmap
 
-> LLM-powered data analyst for TripAdvisor Review Atlas
+## Current system
 
----
+- React chat integrated with the Embedding Atlas selection state.
+- DuckDB-WASM over the local Parquet dataset.
+- Sommelier orchestrator plus specialized review Analyzer.
+- Projection-guided agent loop with coarse scan, parallel circular probes, refinement, comparison, and category-card memory.
+- Structured tool inputs; unrestricted SQL is no longer exposed to the LLM.
+- Per-region `projection_agreement` diagnostic using stored high-dimensional neighbors.
+- Enforced per-request budgets, geometric deduplication, no-progress stopping, and inspectable policy trajectories.
+- Objective-aware semantic stopping, candidate utility ranking, explicit branch states, and calibrated resampling stability.
 
-## ✅ Completed Phases
+## Live tools
 
-### Phase 1: Basic RAG Chat ✅
+| Tool | Status | Purpose |
+| --- | --- | --- |
+| `search_reviews` | Complete | Known lexical and metadata constraints |
+| `scan_regions` | Complete | Coarse density-based candidate regions |
+| `inspect_regions` | Complete | Parallel circular probes and Analyzer summaries |
+| `refine_region` | Complete | Coarse-to-fine children inside a parent circle |
+| `compare_regions` | Complete | Consistent regional statistics |
+| `save_results` | Complete | Verified category-card memory |
 
-Context-aware chat using selected reviews with loading states and error handling.
+## Research/evaluation work
 
-### Phase 2: Agentic Tool Use ✅
+- [ ] Persist complete trajectories with latency and token usage (tool order and stopping reason are already recorded in memory).
+- [ ] Add ANN-only, XY-only, lexical, and hybrid baselines.
+- [ ] Evaluate Recall@k, nDCG, MRR, thematic coverage, diversity, and task completion.
+- [ ] Ablate projection access, spatial tools, and human map interaction.
+- [ ] Test UMAP seeds/parameters and alternative projections.
+- [ ] Add at least one non-wine dataset.
+- [ ] Scale experiments from 10k to 1M items.
 
-LLM can call tools to query data with multi-step reasoning loop.
+## Product work
 
----
+- [ ] Draw Agent probe circles and trajectories directly on the map.
+- [ ] Let users approve, move, resize, and lasso Agent regions.
+- [ ] Persist exploration sessions and export trajectories.
+- [ ] Add explicit time/tool/token budgets to the stopping policy.
+- [ ] Add semantic ANN verification when full embedding vectors are available in the browser.
 
-## Current Capabilities (v0.1)
-
-### Agent Capabilities
-
-The AI agent can analyze hotel reviews through natural language:
-
-| Capability | Status | Description |
-|------------|--------|-------------|
-| SQL Queries | ✅ | Execute complex queries (aggregations, filters, grouping) |
-| Text Search | ✅ | Find reviews by keywords or phrases |
-| Statistics | ✅ | Get counts, averages, rating distributions |
-| Sampling | ✅ | Retrieve example reviews for context |
-| Summarization | ✅ | LLM synthesizes findings into natural language |
-
-### Agent Tools
-
-| Tool | What It Does | Example Query |
-|------|--------------|---------------|
-| `sql_query` | Run SELECT queries on DuckDB | *"How many 5-star reviews mention breakfast?"* |
-| `text_search` | Single keyword/phrase search | *"Find reviews about noisy rooms"* |
-| `flexible_search` | Multi-term AND/OR search | *"breakfast AND Bali Villa"* |
-| `get_stats` | Rating distribution & averages | *"What's the overall sentiment?"* |
-| `get_sample` | Random review samples (with filters) | *"Show me negative reviews"* |
-| `get_topics` | List visible cluster labels from map | *"What topics are on the map?"* |
-
-**Security:** Only SELECT queries allowed. Results capped at 100 rows.
-
-### Chat Features
-
-- ✅ Floating "Atlas Agent" widget with glassmorphism design
-- ✅ Map selection → LLM context (lasso/rectangle tools)
-- ✅ Multi-step agent reasoning (up to 8 tool calls)
-- ✅ Real-time tool execution feedback
-- ✅ Markdown rendering in responses
-
-### Architecture
-
-```
-User Selection (lasso/rect)
-    → DuckDB query via predicate
-    → Context passed to LLM (up to 500 reviews)
-    → Agent calls tools as needed
-    → Response rendered with Markdown
-```
-
----
-
-## 🎯 Next Up: Phase 3 — Agent → Map Selection
-
-**Goal:** Highlight query results on the map
-
-When the agent finds reviews (e.g., "all 1-star reviews mentioning 'dirty'"), those points should be visually selected on the Atlas.
-
-**Research confirmed:**
-- `selection` prop accepts `DataPointID[]` ✅
-- Points render with colored circles + stroke overlay
-
-**Implementation:**
-- [ ] Add `agentSelection` state for query result IDs
-- [ ] Tools return `__row_index__` with results
-- [ ] "Show on map" button in chat
-- [ ] Clear agent selection on new user selection
-
----
-
-## 🚧 Planned Features
-
-### Phase 4: Enhanced Search
-- [x] Multi-term AND/OR search (`flexible_search` tool)
-- [ ] Semantic vector search (cosine similarity)
-- [ ] Fuzzy matching (Levenshtein distance)
-- [ ] Search highlighting on map
-
-### Phase 5: Topic Navigation
-> ⚠️ Partially implemented — `get_topics` done, others pending Atlas API
-
-- [x] `get_topics` — list visible cluster labels ✅ *(implemented via Shadow DOM scraping)*
-- [ ] `select_topic` — get documents in a cluster
-- [ ] `drill_down` — explore sub-clusters
-
-**Implementation Note:** Since the Atlas library doesn't expose topic labels via API, `get_topics` extracts them by traversing the Shadow DOM and finding text elements with hyphenated content (e.g., `amsterdam-museums-tram-hotel`).
-
-**Tracking:** [GitHub Issue #142](https://github.com/apple/embedding-atlas/issues/142)
-
-### Phase 6: Advanced Analytics
-- [ ] Comparative analysis tools
-- [ ] Trend detection
-- [ ] Export/report generation
-
-### Phase 7: UI Polish
-- [ ] Chat history persistence
-- [ ] Multi-turn memory
-- [ ] Suggested questions
-
----
-
-## ⚠️ Known Issues
-
-| Issue | Status | Notes |
-|-------|--------|-------|
-| Sidebar overflow | PR submitted | [#140](https://github.com/apple/embedding-atlas/pull/140) |
-| Stylesheet prop broken | Investigating | Shadow DOM may block custom CSS |
-| Topic labels not exposed | Feature requested | [#142](https://github.com/apple/embedding-atlas/issues/142) |
-
----
-
-## 🔧 Tech Stack
-
-| Layer | Technology |
-|-------|------------|
-| Frontend | React 19 + TypeScript + Vite |
-| Visualization | embedding-atlas (Apple) |
-| Data Engine | DuckDB-WASM + Mosaic |
-| Backend | Vercel Serverless Functions |
-| LLM | OpenRouter → nvidia/nemotron-3-nano |
-
----
-
-## 📁 Project Structure
-
-```
-web-app/
-├── api/
-│   ├── chat.ts          # Basic chat endpoint
-│   └── agent.ts         # Agent with tool calling
-├── src/
-│   ├── App.tsx          # Main component
-│   ├── hooks/
-│   │   └── useAgentChat.ts  # Agent loop logic
-│   └── tools/
-│       └── toolExecutor.ts  # DuckDB tool execution
-├── vercel.json          # Deployment config
-└── .env.local           # API keys (git-ignored)
-```
-
----
-
-## 🚀 Development
-
-```bash
-# Start dev server (required for API routes)
-vercel dev
-
-# Build for production
-npm run build
-```
-
----
-
-## 📝 Notes
-
-- **Context limit:** 100k chars (~25k tokens) per request
-- **Max iterations:** 8 tool calls before forced stop
-- **Model:** `nvidia/nemotron-3-nano-30b-a3b:free` via OpenRouter
+See [Projection-Guided Agentic Search](PROJECTION_AGENT_SEARCH.md) for the method definition and [Architecture](ARCHITECTURE.md) for the implementation.
