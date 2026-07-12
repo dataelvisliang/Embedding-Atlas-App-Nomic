@@ -54,6 +54,7 @@ export interface CandidateAssessment extends Region {
     confidence: number;
     utility: number;
     recommended_action: CandidateAction;
+    acceptance_tier: 'strong' | 'soft' | 'diversity' | null;
     sample_size: number;
     review_ids: number[];
     sample_rounds: number;
@@ -66,7 +67,7 @@ export interface CandidateAssessment extends Region {
 export interface SearchPolicySnapshot {
     must_stop: boolean;
     stop_reason: string | null;
-    objective: { target_accepted_regions: number; requires_comparison: boolean };
+    objective: { target_accepted_regions: number; requires_comparison: boolean; exploration: boolean };
     remaining: PolicyCounters;
     inspected_region_count: number;
     accepted_region_count: number;
@@ -153,7 +154,7 @@ export class SearchPolicy {
         toolCalls: 0, scans: 0, searches: 0, inspectedRegions: 0,
         refinements: 0, comparisons: 0, savedCategories: 0, modelTokens: 0
     };
-    private objective: { targetAcceptedRegions: number; requiresComparison: boolean };
+    private objective: { targetAcceptedRegions: number; requiresComparison: boolean; exploration: boolean };
     private visitedRegions: Region[] = [];
     private scanSignatures = new Set<string>();
     private refinementSignatures = new Set<string>();
@@ -175,6 +176,7 @@ export class SearchPolicy {
         this.limits = { ...DEFAULT_LIMITS, ...limits };
         this.objective = {
             targetAcceptedRegions: requestedResultCount(objective),
+            exploration: /\b(explore|discover|find|map|regions?|themes?|styles?|different|distinct|diverse|unusual|open-ended)\b|探索|发现|地图|区域|主题|风格|不同|多样|少见/i.test(objective),
             requiresComparison: /\b(compare|comparison|difference|different|versus|vs\.?)\b|比较|对比|差异/i.test(objective)
         };
     }
@@ -243,19 +245,21 @@ export class SearchPolicy {
                 newPromisingCandidate = true;
             }
             const combinedThemes = [...new Set([...(prior?.themes || []), ...uniqueThemes])];
-            if (!analysisFailed && intentMatch >= 0.75) {
+            const acceptanceTier = analysisFailed ? null : this.acceptanceTier(intentMatch, purity, combinedThemes);
+            if (!analysisFailed && (intentMatch >= 0.75 || acceptanceTier)) {
                 uniqueThemes.filter(theme => !relevantBefore.has(theme)).forEach(theme => newRelevantThemes.add(theme));
             }
             const novelty = uniqueThemes.length ? uniqueThemes.filter(theme => !themesBefore.has(theme)).length / uniqueThemes.length : 0;
-            const coverageGain = intentMatch >= 0.75 && uniqueThemes.length
+            const coverageGain = (intentMatch >= 0.75 || acceptanceTier) && uniqueThemes.length
                 ? uniqueThemes.filter(theme => !relevantBefore.has(theme)).length / uniqueThemes.length : 0;
             const sampleSize = Math.max(0, Number(region.sample_size) || 0);
             const agreement = Number(region.projection_agreement);
             const projectionConfidence = Number.isFinite(agreement) ? 0.5 + 0.5 * clamp01(agreement) : 0.75;
             const confidence = clamp01(Math.min(1, sampleSize / 12) * projectionConfidence);
-            const rawUtility = analysisFailed ? 0 : 0.45 * intentMatch + 0.20 * purity + 0.15 * novelty + 0.10 * coverageGain + 0.10 * confidence - 0.05;
+            const effectiveIntent = acceptanceTier ? Math.max(intentMatch, 0.75) : intentMatch;
+            const rawUtility = analysisFailed ? 0 : 0.45 * effectiveIntent + 0.20 * purity + 0.15 * novelty + 0.10 * coverageGain + 0.10 * confidence - 0.05;
             const utility = clamp01(rawUtility);
-            const recommendedAction = analysisFailed ? 'reject' : this.recommend(intentMatch, purity, sampleRounds);
+            const recommendedAction = analysisFailed ? 'reject' : this.recommend(intentMatch, purity, sampleRounds, acceptanceTier);
             const parentId = prior?.parent_id || this.findParentId(id);
             const parent = parentId ? this.candidates.get(parentId) : undefined;
             const refineDepth = prior?.refine_depth ?? (parent ? parent.refine_depth + 1 : 0);
@@ -267,7 +271,9 @@ export class SearchPolicy {
                 coverage_gain: Math.round(coverageGain * 1000) / 1000,
                 confidence: Math.round(confidence * 1000) / 1000,
                 utility: Math.round(utility * 1000) / 1000,
-                recommended_action: recommendedAction, sample_size: (prior?.sample_size || 0) + sampleSize,
+                recommended_action: recommendedAction,
+                acceptance_tier: acceptanceTier,
+                sample_size: (prior?.sample_size || 0) + sampleSize,
                 review_ids: [...new Set([...(prior?.review_ids || []), ...(region.review_ids || []).map(Number).filter(Number.isFinite)])],
                 sample_rounds: sampleRounds,
                 score_stability: scoreStability == null ? null : Math.round(scoreStability * 1000) / 1000,
@@ -299,7 +305,7 @@ export class SearchPolicy {
         return {
             must_stop: Boolean(this.stopReason),
             stop_reason: this.stopReason,
-            objective: { target_accepted_regions: this.objective.targetAcceptedRegions, requires_comparison: this.objective.requiresComparison },
+            objective: { target_accepted_regions: this.objective.targetAcceptedRegions, requires_comparison: this.objective.requiresComparison, exploration: this.objective.exploration },
             remaining: {
                 toolCalls: Math.max(0, this.limits.maxToolCalls - this.counters.toolCalls),
                 scans: Math.max(0, this.limits.maxScans - this.counters.scans),
@@ -323,7 +329,24 @@ export class SearchPolicy {
         };
     }
 
-    private recommend(intentMatch: number, purity: number, sampleRounds: number): CandidateAction {
+    private acceptanceTier(intentMatch: number, purity: number, themes: string[]): CandidateAssessment['acceptance_tier'] {
+        if (purity >= 0.70 && intentMatch >= 0.75) return 'strong';
+        if (purity >= 0.75 && intentMatch >= 0.65) return 'soft';
+        if (this.objective.exploration && purity >= 0.70 && intentMatch >= 0.60 && this.hasDistinctAcceptedTheme(themes)) return 'diversity';
+        return null;
+    }
+
+    private hasDistinctAcceptedTheme(themes: string[]): boolean {
+        const normalized = [...new Set(themes.map(theme => theme.trim().toLowerCase()).filter(Boolean))];
+        if (!normalized.length) return false;
+        const acceptedThemes = new Set([...this.candidates.values()]
+            .filter(candidate => candidate.recommended_action === 'accept')
+            .flatMap(candidate => candidate.themes.map(theme => theme.trim().toLowerCase())));
+        return normalized.some(theme => !acceptedThemes.has(theme));
+    }
+
+    private recommend(intentMatch: number, purity: number, sampleRounds: number, acceptanceTier: CandidateAssessment['acceptance_tier']): CandidateAction {
+        if (acceptanceTier) return 'accept';
         if (intentMatch >= 0.75) return purity >= 0.70 ? 'accept' : 'refine';
         if (intentMatch >= 0.60) return purity >= 0.70 ? (sampleRounds > 1 ? 'compare' : 'resample') : 'explore';
         return 'reject';
@@ -336,6 +359,7 @@ export class SearchPolicy {
         const highPurity = accepted.filter(candidate => candidate.purity >= 0.70);
         const comparisonSatisfied = !this.objective.requiresComparison || this.counters.comparisons > 0;
         const frontier = candidates.filter(candidate => frontierAction(candidate.recommended_action) && candidate.utility >= 0.40);
+        const strongFrontier = frontier.filter(candidate => candidate.purity >= 0.70 && candidate.intent_match >= 0.65 && candidate.utility >= 0.50);
         const bestFrontierUtility = frontier.length ? Math.max(...frontier.map(candidate => candidate.utility)) : 0;
         const bestAcceptedUtility = accepted.length ? Math.max(...accepted.map(candidate => candidate.utility)) : 0;
         if (accepted.length >= this.objective.targetAcceptedRegions &&
@@ -350,7 +374,12 @@ export class SearchPolicy {
             this.stopReason = `diminishing returns: ${accepted.length} accepted regions and no high-utility frontier remain`;
             return;
         }
-        if (this.noProgressRounds >= this.limits.maxNoProgressRounds) {
+        if (accepted.length + strongFrontier.length >= this.objective.targetAcceptedRegions &&
+            this.relevantThemes.size + strongFrontier.length >= Math.min(2, this.objective.targetAcceptedRegions)) {
+            this.stopReason = `frontier evidence is sufficient to finalize: ${accepted.length} accepted and ${strongFrontier.length} strong frontier candidates`;
+            return;
+        }
+        if (this.noProgressRounds >= this.limits.maxNoProgressRounds && (accepted.length > 0 || strongFrontier.length === 0)) {
             this.stopReason = `${this.noProgressRounds} consecutive probe rounds found no new relevant themes`;
             return;
         }

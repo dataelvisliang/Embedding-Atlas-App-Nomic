@@ -21,14 +21,16 @@ MANDATORY OPEN-ENDED SEARCH POLICY:
 4. PROBE IN PARALLEL: inspect 3-8 circles together. Avoid overlapping or previously visited circles.
 5. OBSERVE EACH CIRCLE: consider density, sample_size, purity, intent_match, category/themes, representative evidence, and projection_agreement. Purity asks whether the circle is internally coherent; intent_match asks whether that coherent content answers the user. Prefer high values on both. Low projection agreement reduces confidence; it does not automatically invalidate content evidence.
 6. ADAPT:
-   - intent_match >= 0.75 and purity >= 0.70 -> accept;
+   - strong accept: purity >= 0.70 and intent_match >= 0.75 -> accept;
+   - soft accept: purity >= 0.75 and intent_match >= 0.65 -> accept if sampled evidence does not visibly violate a hard user constraint;
+   - diversity accept: for exploration/diverse-region queries, accept a clear, non-duplicate theme with purity >= 0.70 and intent_match >= 0.60 when it adds meaningful coverage;
    - intent_match >= 0.75 and purity < 0.70 -> refine once using that candidate's ID as parent_id and objective="maximize_purity", then batch-inspect the best children;
    - 0.60 <= intent_match < 0.75 and purity >= 0.70 -> resample once by listing its ID in resample_ids; after resampling, compare it with another plausible candidate;
    - 0.60 <= intent_match < 0.75 and purity < 0.70 -> explore only if utility >= 0.40 and budget justify it; prefer objective="maximize_intent_match" or "find_distinct_subthemes";
    - intent_match < 0.60 -> reject that branch unless a policy recommendation explicitly says otherwise;
    - follow candidate recommended_action and utility from SEARCH_POLICY_STATE; do not refine rejected or already accepted candidates.
    - repeated themes, analysis_failed, or empty probes -> stop expanding that branch.
-7. STOP: finish when the controller reports enough accepted regions and relevant-theme coverage, when it reports diminishing returns, when two rounds add no new relevant theme, when frontier utility is too low, or when a hard budget fires. If you found strong evidence for fewer than the requested number and must_stop=true, answer with the strong findings plus any weaker caveat rather than continuing search. Do not treat a novel but irrelevant theme as progress. Do not consume the full budget merely because it remains.
+7. STOP: finish when the controller reports enough accepted regions and relevant-theme coverage, when it reports sufficient strong frontier evidence to finalize, when it reports diminishing returns, when two rounds add no new relevant theme and no strong frontier remains, when frontier utility is too low, or when a hard budget fires. If you found strong evidence for fewer than the requested number and must_stop=true, answer with the strong findings plus any weaker caveat rather than continuing search. Do not keep searching merely because accepted=0 if frontier contains high-purity, high-intent candidates; promote them in the answer with caveats. Do not treat a novel but irrelevant theme as progress. Do not consume the full budget merely because it remains.
 8. SAVE: call save_results once per final category using only IDs returned by verified search/probe results. Reference the exact label as {{CATEGORY_NAME}}. Never print raw IDs. After must_stop=true, save at most once total, then provide the final answer even if fewer findings were saved than requested.
 
 For simple known-item questions, search_reviews may be sufficient. For open-ended discovery, the value comes from observation-dependent actions: scan -> parallel probe -> observe -> refine/compare/stop. A fixed one-shot batch without adaptation is not a complete agentic search.`;

@@ -91,15 +91,17 @@ utility =
   - 0.05 search_cost
 ```
 
-`confidence` combines sample sufficiency with projection agreement. Projection agreement affects confidence, not relevance. The controller assigns an explicit next state:
+`confidence` combines sample sufficiency with projection agreement. Projection agreement affects confidence, not relevance. Accepted regions now carry an `acceptance_tier`:
 
-| Intent match | Purity | State/action |
-| ---: | ---: | --- |
-| >= 0.75 | >= 0.70 | `accept` |
-| >= 0.75 | < 0.70 | `refine` |
-| 0.45-0.75 | >= 0.70 | `resample` once, then `compare` |
-| 0.45-0.75 | < 0.70 | `explore` only when utility justifies cost |
-| < 0.45 | any | `reject` |
+| Tier | Intent match | Purity | State/action |
+| --- | ---: | ---: | --- |
+| `strong` | >= 0.75 | >= 0.70 | `accept` |
+| `soft` | >= 0.65 | >= 0.75 | `accept` unless sampled evidence visibly violates a hard user constraint |
+| `diversity` | >= 0.60 | >= 0.70 | `accept` for exploration/diverse-region queries when the theme is clear and non-duplicate |
+| none | >= 0.75 | < 0.70 | `refine` |
+| none | 0.60-0.75 | >= 0.70 | `resample` once, then `compare` |
+| none | 0.60-0.75 | < 0.70 | `explore` only when utility justifies cost |
+| none | < 0.60 | any | `reject` |
 
 Refinement requires the ID of a candidate in `refine` or `explore`; comparison requires at least two inspected, non-rejected IDs. Spatial review IDs can be saved only from `accept` candidates. A resampled candidate aggregates both score rounds and reports `score_stability`.
 
@@ -109,8 +111,9 @@ The controller extracts a requested result count from explicit user wording when
 
 - the accepted-region target is met;
 - enough accepted regions have purity >= 0.70;
+- enough strong frontier candidates exist to finalize without another blind search round;
 - relevant-theme coverage reaches the target (capped at two themes);
 - a requested comparison has actually executed;
-- or two rounds add no new relevant theme;
+- or two rounds add no new relevant theme and no strong frontier remains;
 - or the best remaining frontier utility falls below 0.15 after at least two probe rounds;
 - or any hard action/token/time budget fires.

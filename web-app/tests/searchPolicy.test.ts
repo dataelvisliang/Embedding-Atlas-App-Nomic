@@ -52,7 +52,7 @@ retryPolicy.evaluate(call('scan_regions', { grid_size: 1 }));
 retryPolicy.evaluate(call('scan_regions', { grid_size: 1 }));
 assert.equal(retryPolicy.snapshot().must_stop, true, 'repeated blocked retries should force convergence');
 
-const matrixPolicy = new SearchPolicy({}, 'explore wine styles');
+const matrixPolicy = new SearchPolicy({}, 'recommend bold red wine');
 const matrixCall = call('inspect_regions', {
     intent: 'bold red wine',
     regions: [
@@ -93,6 +93,22 @@ const resampled = matrixPolicy.snapshot().candidates.find(candidate => candidate
 assert.equal(resampled?.recommended_action, 'compare', 'a medium-match candidate should move from resample to compare');
 assert.equal(resampled?.sample_rounds, 2);
 assert.ok((resampled?.score_stability || 0) > 0.9, 'stable repeated scores should report high stability');
+
+const diversityPolicy = new SearchPolicy({}, 'explore three distinct savory red wine regions');
+const diversityCall = call('inspect_regions', {
+    intent: 'savory red wine regions',
+    regions: [
+        { id: 'diverse-a', center_x: 0, center_y: 0, radius: 1 },
+        { id: 'diverse-b', center_x: 3, center_y: 0, radius: 1 }
+    ]
+});
+assert.ok(diversityPolicy.evaluate(diversityCall).call);
+diversityPolicy.record({ name: 'inspect_regions', call_id: diversityCall.id, result: { regions: [
+    { id: 'diverse-a', center_x: 0, center_y: 0, radius: 1, category: 'earthy Rioja', themes: ['earthy rioja'], purity: 0.8, intent_match: 0.62, sample_size: 12, review_ids: [401] },
+    { id: 'diverse-b', center_x: 3, center_y: 0, radius: 1, category: 'peppery Syrah', themes: ['peppery syrah'], purity: 0.78, intent_match: 0.63, sample_size: 12, review_ids: [402] }
+] } });
+const diversityActions = Object.fromEntries(diversityPolicy.snapshot().candidates.map(candidate => [candidate.id, [candidate.recommended_action, candidate.acceptance_tier]]));
+assert.deepEqual(diversityActions, { 'diverse-a': ['accept', 'diversity'], 'diverse-b': ['accept', 'diversity'] });
 
 const failurePolicy = new SearchPolicy();
 const failureCall = call('inspect_regions', { intent: 'savory red', regions: [{ id: 'failed', center_x: 0, center_y: 0, radius: 1 }] });

@@ -713,6 +713,7 @@ class Candidate:
     projection_agreement: float | None
     utility: float
     recommended_action: str
+    acceptance_tier: str | None
     sample_size: int
     review_ids: list[int]
     parent_id: str | None = None
@@ -723,6 +724,7 @@ class Candidate:
 @dataclass
 class PilotPolicy:
     target_count: int
+    exploration: bool = False
     started_at: float = field(default_factory=time.time)
     tool_calls: int = 0
     scans: int = 0
@@ -754,7 +756,7 @@ class PilotPolicy:
         return {
             "must_stop": bool(self.stop_reason),
             "stop_reason": self.stop_reason,
-            "objective": {"target_accepted_regions": self.target_count, "requires_comparison": False},
+            "objective": {"target_accepted_regions": self.target_count, "requires_comparison": False, "exploration": self.exploration},
             "remaining": {
                 "toolCalls": max(0, 18 - self.tool_calls),
                 "scans": max(0, 2 - self.scans),
@@ -892,13 +894,17 @@ class PilotPolicy:
             purity = 0.0 if analysis_failed else score_value(region.get("purity"), 0.0)
             intent_match = 0.0 if analysis_failed else score_value(region.get("intent_match"), 0.0)
             novelty = len([theme for theme in themes if theme not in before_themes]) / len(themes) if themes else 0
-            coverage = len([theme for theme in themes if intent_match >= 0.75 and theme not in before_relevant]) / len(themes) if themes else 0
+            acceptance_tier = None if analysis_failed else self.acceptance_tier(intent_match, purity, themes)
+            coverage = len([theme for theme in themes if (intent_match >= 0.75 or acceptance_tier) and theme not in before_relevant]) / len(themes) if themes else 0
             agreement = region.get("projection_agreement")
             projection_confidence = 0.5 + 0.5 * score_value(agreement, 0.5) if isinstance(agreement, (int, float)) else 0.75
             confidence = min(1.0, float(region.get("sample_size") or 0) / 12) * projection_confidence
-            utility = 0.0 if analysis_failed else max(0.0, min(1.0, 0.45 * intent_match + 0.20 * purity + 0.15 * novelty + 0.10 * coverage + 0.10 * confidence - 0.05))
+            effective_intent = max(intent_match, 0.75) if acceptance_tier else intent_match
+            utility = 0.0 if analysis_failed else max(0.0, min(1.0, 0.45 * effective_intent + 0.20 * purity + 0.15 * novelty + 0.10 * coverage + 0.10 * confidence - 0.05))
             if analysis_failed or intent_match < 0.60:
                 action = "reject"
+            elif acceptance_tier:
+                action = "accept"
             elif intent_match >= 0.75:
                 action = "accept" if purity >= 0.70 else "refine"
             else:
@@ -924,6 +930,7 @@ class PilotPolicy:
                 projection_agreement=agreement if isinstance(agreement, (int, float)) else None,
                 utility=round(utility, 3),
                 recommended_action=action,
+                acceptance_tier=acceptance_tier,
                 sample_size=int(region.get("sample_size") or 0),
                 review_ids=[int(value) for value in region.get("review_ids", [])],
                 parent_id=parent_id,
@@ -934,19 +941,43 @@ class PilotPolicy:
         self.events.append({"tool": "inspect_regions", "status": "completed", "detail": f"{len(result['result'].get('regions', []))} probes; {new_relevant} new relevant themes"})
         self.evaluate_stop()
 
+    def acceptance_tier(self, intent_match: float, purity: float, themes: list[str]) -> str | None:
+        if purity >= 0.70 and intent_match >= 0.75:
+            return "strong"
+        if purity >= 0.75 and intent_match >= 0.65:
+            return "soft"
+        if self.exploration and purity >= 0.70 and intent_match >= 0.60 and self.has_distinct_accepted_theme(themes):
+            return "diversity"
+        return None
+
+    def has_distinct_accepted_theme(self, themes: list[str]) -> bool:
+        normalized = {theme.strip().lower() for theme in themes if theme.strip()}
+        if not normalized:
+            return False
+        accepted_themes = {
+            theme.strip().lower()
+            for candidate in self.candidates.values()
+            if candidate.recommended_action == "accept"
+            for theme in candidate.themes
+        }
+        return any(theme not in accepted_themes for theme in normalized)
+
     def evaluate_stop(self) -> None:
         if self.stop_reason:
             return
         candidates = list(self.candidates.values())
         accepted = [candidate for candidate in candidates if candidate.recommended_action == "accept"]
         frontier = [candidate for candidate in candidates if candidate.recommended_action in {"refine", "resample", "compare", "explore"} and candidate.utility >= 0.40]
+        strong_frontier = [candidate for candidate in frontier if candidate.purity >= 0.70 and candidate.intent_match >= 0.65 and candidate.utility >= 0.50]
         best_frontier = max([candidate.utility for candidate in frontier], default=0)
         best_accepted = max([candidate.utility for candidate in accepted], default=0)
         if len(accepted) >= self.target_count and len(self.relevant_themes) >= min(2, self.target_count):
             self.stop_reason = f"semantic evidence target satisfied: {len(accepted)} accepted regions and {len(self.relevant_themes)} relevant themes"
         elif len(accepted) >= max(1, self.target_count - 1) and len(self.relevant_themes) >= min(2, self.target_count) and (best_frontier == 0 or best_frontier < best_accepted * 0.65):
             self.stop_reason = f"diminishing returns: {len(accepted)} accepted regions and no high-utility frontier remain"
-        elif self.no_progress_rounds >= 2:
+        elif len(accepted) + len(strong_frontier) >= self.target_count and len(self.relevant_themes) + len(strong_frontier) >= min(2, self.target_count):
+            self.stop_reason = f"frontier evidence is sufficient to finalize: {len(accepted)} accepted and {len(strong_frontier)} strong frontier candidates"
+        elif self.no_progress_rounds >= 2 and (accepted or not strong_frontier):
             self.stop_reason = "2 consecutive probe rounds found no new relevant themes"
         elif frontier and best_frontier < 0.45:
             self.stop_reason = "best remaining candidate utility is below 0.45"
@@ -1079,7 +1110,7 @@ def force_final_answer(client: OpenRouterClient, prompt: str, messages: list[dic
 
 
 def run_query(query: dict[str, Any], prompt: str, tools: AtlasTools, client: OpenRouterClient, max_steps: int, seed: int, verbose: bool) -> dict[str, Any]:
-    policy = PilotPolicy(target_count=int(query.get("target_count") or 3))
+    policy = PilotPolicy(target_count=int(query.get("target_count") or 3), exploration=is_exploration_query(str(query.get("query") or "")))
     messages: list[dict[str, Any]] = [{"role": "user", "content": query["query"]}]
     final_answer = ""
     tool_result_log: list[dict[str, Any]] = []
@@ -1186,6 +1217,7 @@ def run_query(query: dict[str, Any], prompt: str, tools: AtlasTools, client: Ope
         "intent_match",
         "utility",
         "recommended_action",
+        "acceptance_tier",
         "density",
         "projection_agreement",
         "review_ids",
@@ -1216,6 +1248,7 @@ def run_query(query: dict[str, Any], prompt: str, tools: AtlasTools, client: Ope
                 "intent_match": item["intent_match"],
                 "utility": item["utility"],
                 "recommended_action": item["recommended_action"],
+                "acceptance_tier": item.get("acceptance_tier"),
                 "review_ids": item.get("review_ids", []),
             }
             for item in candidates
@@ -1251,6 +1284,10 @@ def stable_pattern(events: list[dict[str, Any]]) -> bool:
     if not inspect_events:
         return False
     return any(len((event.get("parameters") or {}).get("regions", [])) >= 3 for event in inspect_events)
+
+
+def is_exploration_query(query: str) -> bool:
+    return bool(re.search(r"\b(explore|discover|find|map|regions?|themes?|styles?|different|distinct|diverse|unusual|open-ended)\b|探索|发现|地图|区域|主题|风格|不同|多样|少见", query, re.I))
 
 
 def sanitize_final_answer(answer: str) -> str:
