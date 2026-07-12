@@ -1,0 +1,48 @@
+{
+  "created_at": "20260712T153808Z",
+  "model": "deepseek/deepseek-v4-pro",
+  "output": "C:\\Users\\liang\\Desktop\\ML Notebooks\\Embedding-Atlas-Agent\\benchmark\\runs\\pilot\\par_pilot_20260712T153808Z.jsonl",
+  "queries": [
+    {
+      "query_id": "wine-dev-005",
+      "stable_pattern": true,
+      "accepted": 1,
+      "rejected": 10,
+      "frontier": 1,
+      "stop_reason": null,
+      "final_answer_present": true,
+      "tokens": 66337,
+      "latency_ms": 235253,
+      "cost_usd": 0.056537
+    },
+    {
+      "query_id": "wine-dev-006",
+      "stable_pattern": true,
+      "accepted": 0,
+      "rejected": 9,
+      "frontier": 4,
+      "stop_reason": null,
+      "final_answer_present": true,
+      "tokens": 75217,
+      "latency_ms": 177487,
+      "cost_usd": 0.063413
+    },
+    {
+      "query_id": "wine-dev-010",
+      "stable_pattern": true,
+      "accepted": 0,
+      "rejected": 10,
+      "frontier": 2,
+      "stop_reason": "2 consecutive probe rounds found no new relevant themes",
+      "final_answer_present": true,
+      "tokens": 67435,
+      "latency_ms": 201742,
+      "cost_usd": 0.064521
+    }
+  ],
+  "totals": {
+    "tokens": 208989,
+    "cost_usd": 0.184471,
+    "latency_ms": 614482
+  }
+}
