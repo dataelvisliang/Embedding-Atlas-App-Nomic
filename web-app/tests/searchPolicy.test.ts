@@ -75,6 +75,12 @@ const actions = Object.fromEntries(matrixPolicy.snapshot().candidates.map(candid
 assert.deepEqual(actions, { 'accept-me': 'accept', 'refine-me': 'refine', 'resample-me': 'resample', 'reject-me': 'reject' });
 assert.ok(matrixPolicy.evaluate(call('refine_region', { parent_id: 'refine-me', center_x: 3, center_y: 0, radius: 1 })).call, 'refine recommendation should authorize refinement');
 assert.equal(matrixPolicy.evaluate(call('refine_region', { parent_id: 'accept-me', center_x: 0, center_y: 0, radius: 1 })).blockedResult?.result.policy_blocked, true, 'accepted branch should not be refined');
+const childCall = call('inspect_regions', { intent: 'bold red wine', regions: [{ id: 'refine-me-1', center_x: 3.2, center_y: 0, radius: 0.5 }] });
+assert.ok(matrixPolicy.evaluate(childCall).call, 'refined child inspection should pass');
+matrixPolicy.record({ name: 'inspect_regions', call_id: childCall.id, result: { regions: [
+    { id: 'refine-me-1', center_x: 3.2, center_y: 0, radius: 0.5, category: 'B child', themes: ['b child'], purity: 0.5, intent_match: 0.9, sample_size: 12, review_ids: [106] }
+] } });
+assert.equal(matrixPolicy.evaluate(call('refine_region', { parent_id: 'refine-me-1', center_x: 3.2, center_y: 0, radius: 0.5 })).blockedResult?.result.policy_blocked, true, 'refine depth should be capped per branch');
 const resampleCall = call('inspect_regions', {
     intent: 'bold red wine', resample_ids: ['resample-me'],
     regions: [{ id: 'resample-me', center_x: 6, center_y: 0, radius: 1 }]
@@ -88,6 +94,16 @@ assert.equal(resampled?.recommended_action, 'compare', 'a medium-match candidate
 assert.equal(resampled?.sample_rounds, 2);
 assert.ok((resampled?.score_stability || 0) > 0.9, 'stable repeated scores should report high stability');
 
+const failurePolicy = new SearchPolicy();
+const failureCall = call('inspect_regions', { intent: 'savory red', regions: [{ id: 'failed', center_x: 0, center_y: 0, radius: 1 }] });
+failurePolicy.evaluate(failureCall);
+failurePolicy.record({ name: 'inspect_regions', call_id: failureCall.id, result: { regions: [
+    { id: 'failed', center_x: 0, center_y: 0, radius: 1, category: 'Analysis failed', themes: [], purity: 0.5, intent_match: 0.5, sample_size: 12, review_ids: [301], analysis_failed: true }
+] } });
+const failed = failurePolicy.snapshot().candidates.find(candidate => candidate.id === 'failed');
+assert.equal(failed?.recommended_action, 'reject', 'analysis_failed regions should not become neutral frontier candidates');
+assert.equal(failed?.utility, 0);
+
 const targetPolicy = new SearchPolicy({}, 'recommend 1 wine');
 const targetCall = call('inspect_regions', { intent: 'earthy red', regions: [{ id: 'winner', center_x: 0, center_y: 0, radius: 1 }] });
 targetPolicy.evaluate(targetCall);
@@ -95,5 +111,10 @@ targetPolicy.record({ name: 'inspect_regions', call_id: targetCall.id, result: {
     { id: 'winner', center_x: 0, center_y: 0, radius: 1, category: 'Earthy red', themes: ['earthy'], purity: 0.9, intent_match: 0.9, sample_size: 12, review_ids: [201] }
 ] } });
 assert.equal(targetPolicy.snapshot().must_stop, true, 'objective-aware evidence target should stop search');
+const saveAfterStop = call('save_results', { category: 'Earthy red', review_ids: [201] });
+assert.ok(targetPolicy.evaluate(saveAfterStop).call, 'one final save after stopping should pass');
+const duplicateSave = targetPolicy.evaluate(call('save_results', { category: 'Earthy red', review_ids: [201] }));
+assert.equal(duplicateSave.blockedResult?.result.policy_blocked, true, 'duplicate save after stopping should be blocked');
+assert.match(String(duplicateSave.blockedResult?.result.instruction), /final answer now/i, 'blocked duplicate save should force finalization');
 
 console.log('searchPolicy tests passed');

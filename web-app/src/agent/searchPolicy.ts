@@ -16,6 +16,7 @@ interface PolicyLimits {
     maxComparisons: number;
     maxSavedCategories: number;
     maxNoProgressRounds: number;
+    maxRefineDepthPerBranch: number;
     maxModelTokens: number;
     maxElapsedMs: number;
 }
@@ -57,6 +58,9 @@ export interface CandidateAssessment extends Region {
     review_ids: number[];
     sample_rounds: number;
     score_stability: number | null;
+    parent_id?: string;
+    refine_depth: number;
+    analysis_failed: boolean;
 }
 
 export interface SearchPolicySnapshot {
@@ -90,6 +94,7 @@ const DEFAULT_LIMITS: PolicyLimits = {
     maxComparisons: 4,
     maxSavedCategories: 8,
     maxNoProgressRounds: 2,
+    maxRefineDepthPerBranch: 1,
     maxModelTokens: 80_000,
     maxElapsedMs: 120_000
 };
@@ -138,6 +143,10 @@ function requestedResultCount(objective: string): number {
     return match ? Number(match[1]) : 3;
 }
 
+function frontierAction(action: CandidateAction): boolean {
+    return ['refine', 'resample', 'compare', 'explore'].includes(action);
+}
+
 export class SearchPolicy {
     private limits: PolicyLimits;
     private counters: PolicyCounters = {
@@ -149,6 +158,7 @@ export class SearchPolicy {
     private scanSignatures = new Set<string>();
     private refinementSignatures = new Set<string>();
     private comparisonSignatures = new Set<string>();
+    private saveSignatures = new Set<string>();
     private discoveredThemes = new Set<string>();
     private relevantThemes = new Set<string>();
     private candidates = new Map<string, CandidateAssessment>();
@@ -159,6 +169,7 @@ export class SearchPolicy {
     private events: PolicyEvent[] = [];
     private startedAt = Date.now();
     private consecutiveBlockedActions = 0;
+    private savedAfterStop = false;
 
     constructor(limits: Partial<PolicyLimits> = {}, objective = '') {
         this.limits = { ...DEFAULT_LIMITS, ...limits };
@@ -202,6 +213,7 @@ export class SearchPolicy {
             id?: string; category?: unknown; themes?: unknown[]; purity?: unknown; intent_match?: unknown;
             projection_agreement?: unknown; sample_size?: unknown; review_ids?: unknown[];
             analyzer_usage?: { total_tokens?: unknown };
+            analysis_failed?: unknown;
         };
         const payload = result.result as { regions?: ProbeResult[] } | null;
         const themesBefore = new Set(this.discoveredThemes);
@@ -220,17 +232,18 @@ export class SearchPolicy {
 
             const id = region.id || `probe-${this.probeRounds + 1}-${index + 1}`;
             const prior = this.candidates.get(id);
-            const rawPurity = clamp01(region.purity);
-            const rawIntentMatch = clamp01(region.intent_match);
+            const analysisFailed = Boolean(region.analysis_failed);
+            const rawPurity = analysisFailed ? 0 : clamp01(region.purity);
+            const rawIntentMatch = analysisFailed ? 0 : clamp01(region.intent_match);
             const sampleRounds = (prior?.sample_rounds || 0) + 1;
             const purity = prior ? (prior.purity * prior.sample_rounds + rawPurity) / sampleRounds : rawPurity;
             const intentMatch = prior ? (prior.intent_match * prior.sample_rounds + rawIntentMatch) / sampleRounds : rawIntentMatch;
             const scoreStability = prior ? clamp01(1 - Math.max(Math.abs(prior.purity - rawPurity), Math.abs(prior.intent_match - rawIntentMatch))) : null;
-            if (!prior && intentMatch >= 0.45 && intentMatch < 0.75 && uniqueThemes.some(theme => !themesBefore.has(theme))) {
+            if (!analysisFailed && !prior && intentMatch >= 0.60 && intentMatch < 0.75 && uniqueThemes.some(theme => !themesBefore.has(theme))) {
                 newPromisingCandidate = true;
             }
             const combinedThemes = [...new Set([...(prior?.themes || []), ...uniqueThemes])];
-            if (intentMatch >= 0.75) {
+            if (!analysisFailed && intentMatch >= 0.75) {
                 uniqueThemes.filter(theme => !relevantBefore.has(theme)).forEach(theme => newRelevantThemes.add(theme));
             }
             const novelty = uniqueThemes.length ? uniqueThemes.filter(theme => !themesBefore.has(theme)).length / uniqueThemes.length : 0;
@@ -240,8 +253,12 @@ export class SearchPolicy {
             const agreement = Number(region.projection_agreement);
             const projectionConfidence = Number.isFinite(agreement) ? 0.5 + 0.5 * clamp01(agreement) : 0.75;
             const confidence = clamp01(Math.min(1, sampleSize / 12) * projectionConfidence);
-            const utility = clamp01(0.45 * intentMatch + 0.20 * purity + 0.15 * novelty + 0.10 * coverageGain + 0.10 * confidence - 0.05);
-            const recommendedAction = this.recommend(intentMatch, purity, sampleRounds);
+            const rawUtility = analysisFailed ? 0 : 0.45 * intentMatch + 0.20 * purity + 0.15 * novelty + 0.10 * coverageGain + 0.10 * confidence - 0.05;
+            const utility = clamp01(rawUtility);
+            const recommendedAction = analysisFailed ? 'reject' : this.recommend(intentMatch, purity, sampleRounds);
+            const parentId = prior?.parent_id || this.findParentId(id);
+            const parent = parentId ? this.candidates.get(parentId) : undefined;
+            const refineDepth = prior?.refine_depth ?? (parent ? parent.refine_depth + 1 : 0);
             this.candidates.set(id, {
                 id, center_x: Number(region.center_x), center_y: Number(region.center_y), radius: Number(region.radius),
                 category: typeof region.category === 'string' ? region.category : prior?.category || 'Unknown', themes: combinedThemes,
@@ -253,7 +270,10 @@ export class SearchPolicy {
                 recommended_action: recommendedAction, sample_size: (prior?.sample_size || 0) + sampleSize,
                 review_ids: [...new Set([...(prior?.review_ids || []), ...(region.review_ids || []).map(Number).filter(Number.isFinite)])],
                 sample_rounds: sampleRounds,
-                score_stability: scoreStability == null ? null : Math.round(scoreStability * 1000) / 1000
+                score_stability: scoreStability == null ? null : Math.round(scoreStability * 1000) / 1000,
+                parent_id: parentId,
+                refine_depth: refineDepth,
+                analysis_failed: analysisFailed
             });
         }
 
@@ -275,6 +295,7 @@ export class SearchPolicy {
         const elapsedMs = Date.now() - this.startedAt;
         if (elapsedMs >= this.limits.maxElapsedMs && !this.stopReason) this.stopReason = `wall-clock budget ${this.limits.maxElapsedMs}ms exhausted`;
         const candidates = [...this.candidates.values()].sort((a, b) => b.utility - a.utility);
+        const frontier = candidates.filter(candidate => frontierAction(candidate.recommended_action) && candidate.utility >= 0.40);
         return {
             must_stop: Boolean(this.stopReason),
             stop_reason: this.stopReason,
@@ -295,7 +316,7 @@ export class SearchPolicy {
             relevant_themes: [...this.relevantThemes].slice(-30),
             no_progress_rounds: this.noProgressRounds,
             elapsed_ms: elapsedMs,
-            frontier: candidates.filter(candidate => ['refine', 'resample', 'compare', 'explore'].includes(candidate.recommended_action)),
+            frontier,
             candidates,
             recent_events: this.events.slice(-8),
             trajectory: [...this.events]
@@ -304,7 +325,7 @@ export class SearchPolicy {
 
     private recommend(intentMatch: number, purity: number, sampleRounds: number): CandidateAction {
         if (intentMatch >= 0.75) return purity >= 0.70 ? 'accept' : 'refine';
-        if (intentMatch >= 0.45) return purity >= 0.70 ? (sampleRounds > 1 ? 'compare' : 'resample') : 'explore';
+        if (intentMatch >= 0.60) return purity >= 0.70 ? (sampleRounds > 1 ? 'compare' : 'resample') : 'explore';
         return 'reject';
     }
 
@@ -314,19 +335,32 @@ export class SearchPolicy {
         const accepted = candidates.filter(candidate => candidate.recommended_action === 'accept');
         const highPurity = accepted.filter(candidate => candidate.purity >= 0.70);
         const comparisonSatisfied = !this.objective.requiresComparison || this.counters.comparisons > 0;
+        const frontier = candidates.filter(candidate => frontierAction(candidate.recommended_action) && candidate.utility >= 0.40);
+        const bestFrontierUtility = frontier.length ? Math.max(...frontier.map(candidate => candidate.utility)) : 0;
+        const bestAcceptedUtility = accepted.length ? Math.max(...accepted.map(candidate => candidate.utility)) : 0;
         if (accepted.length >= this.objective.targetAcceptedRegions &&
             highPurity.length >= Math.min(2, this.objective.targetAcceptedRegions) &&
             this.relevantThemes.size >= Math.min(2, this.objective.targetAcceptedRegions) && comparisonSatisfied) {
             this.stopReason = `semantic evidence target satisfied: ${accepted.length} accepted regions and ${this.relevantThemes.size} relevant themes`;
             return;
         }
+        if (accepted.length >= Math.max(1, this.objective.targetAcceptedRegions - 1) &&
+            this.relevantThemes.size >= Math.min(2, this.objective.targetAcceptedRegions) &&
+            comparisonSatisfied && (bestFrontierUtility === 0 || bestFrontierUtility < bestAcceptedUtility * 0.65)) {
+            this.stopReason = `diminishing returns: ${accepted.length} accepted regions and no high-utility frontier remain`;
+            return;
+        }
         if (this.noProgressRounds >= this.limits.maxNoProgressRounds) {
             this.stopReason = `${this.noProgressRounds} consecutive probe rounds found no new relevant themes`;
             return;
         }
-        const frontier = candidates.filter(candidate => ['refine', 'resample', 'compare', 'explore'].includes(candidate.recommended_action));
-        if (this.probeRounds >= 2 && frontier.length > 0 && Math.max(...frontier.map(candidate => candidate.utility)) < 0.15) {
-            this.stopReason = 'best remaining candidate utility is below 0.15';
+        if (this.probeRounds >= 2 && frontier.length === 0 && accepted.length > 0 &&
+            (accepted.length >= this.objective.targetAcceptedRegions || this.relevantThemes.size >= Math.min(2, this.objective.targetAcceptedRegions))) {
+            this.stopReason = 'no remaining frontier candidate meets utility threshold 0.40';
+            return;
+        }
+        if (this.probeRounds >= 2 && bestFrontierUtility > 0 && bestFrontierUtility < 0.45) {
+            this.stopReason = 'best remaining candidate utility is below 0.45';
         }
     }
 
@@ -380,6 +414,9 @@ export class SearchPolicy {
         const parentId = typeof args.parent_id === 'string' ? args.parent_id : '';
         const candidate = this.candidates.get(parentId);
         if (!candidate) return this.block(call, 'refine_region requires parent_id from an inspected candidate');
+        if (candidate.refine_depth >= this.limits.maxRefineDepthPerBranch) {
+            return this.block(call, `candidate ${parentId} already reached refine depth ${this.limits.maxRefineDepthPerBranch}`);
+        }
         if (!['refine', 'explore'].includes(candidate.recommended_action)) {
             return this.block(call, `candidate ${parentId} is ${candidate.recommended_action}, not a refinement branch`);
         }
@@ -414,6 +451,14 @@ export class SearchPolicy {
         if (this.counters.savedCategories >= this.limits.maxSavedCategories) return this.block(call, 'saved-category budget exhausted');
         const args = parseArguments(call);
         const requestedIds = Array.isArray(args.review_ids) ? args.review_ids.map(Number).filter(Number.isFinite) : [];
+        const category = typeof args.category === 'string' ? args.category.trim().toLowerCase() : '';
+        const saveKey = signature({ category, review_ids: [...new Set(requestedIds)].sort((a, b) => a - b) });
+        if (this.stopReason && this.savedAfterStop) {
+            return this.block(call, 'search is already stopped and final save has already been attempted; answer now without more tools');
+        }
+        if (this.saveSignatures.has(saveKey)) {
+            return this.block(call, 'duplicate save_results request; answer now without more tools');
+        }
         const inspectedIds = new Set([...this.candidates.values()].flatMap(candidate => candidate.review_ids));
         const acceptedIds = new Set([...this.candidates.values()]
             .filter(candidate => candidate.recommended_action === 'accept')
@@ -427,6 +472,8 @@ export class SearchPolicy {
             ...call,
             function: { ...call.function, arguments: JSON.stringify({ ...args, review_ids: eligibleIds }) }
         };
+        this.saveSignatures.add(saveKey);
+        if (this.stopReason) this.savedAfterStop = true;
         return this.accept(rewritten, false);
     }
 
@@ -448,7 +495,7 @@ export class SearchPolicy {
                 result: {
                     policy_blocked: true,
                     reason,
-                    instruction: this.stopReason ? 'Do not call more search tools. Save verified findings if needed, then answer.' : 'Follow the candidate recommendations and remaining budget in SEARCH_POLICY_STATE.',
+                    instruction: this.stopReason ? 'Do not call more tools. Provide the final answer now, using verified findings and noting any missing target count.' : 'Follow the candidate recommendations and remaining budget in SEARCH_POLICY_STATE.',
                     policy: this.snapshot()
                 }
             }
@@ -457,5 +504,12 @@ export class SearchPolicy {
 
     private addEvent(tool: string, status: PolicyEvent['status'], detail?: string, newThemes?: string[], parameters?: unknown): void {
         this.events.push({ sequence: this.events.length + 1, tool, status, detail, newThemes, parameters });
+    }
+
+    private findParentId(id: string): string | undefined {
+        const matches = [...this.candidates.keys()]
+            .filter(candidateId => id.startsWith(`${candidateId}-`))
+            .sort((a, b) => b.length - a.length);
+        return matches[0];
     }
 }

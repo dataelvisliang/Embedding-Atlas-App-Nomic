@@ -19,7 +19,7 @@ Calibration:
 - 0.10-0.39: weak support
 - 0.00-0.09: absent or contradicted
 
-Output your analysis as JSON:
+Output only one JSON object with exactly these keys:
 {
   "category": "...",
   "sentiment": "Excellent|Good|Mediocre",
@@ -32,7 +32,7 @@ Output your analysis as JSON:
   "outlier_count": 0
 }
 
-Score the supplied reviews only. Do not infer from coordinates or density. Be precise and data-driven. The category should be informative.`;
+If the sampled reviews are mixed, still choose the best concise category and lower the purity score. Score the supplied reviews only. Do not infer from coordinates or density. Be precise and data-driven. The category should be informative.`;
 
 interface AnalyzerRequest {
     region: {
@@ -62,12 +62,38 @@ interface AnalyzerResponse {
     intent_match: number;
     intent_match_rationale: string;
     outlier_count: number;
+    analysis_failed?: boolean;
 }
 
 const normalizedScore = (value: unknown, fallback = 0.5): number => {
+    if (typeof value === 'string') {
+        const label = value.trim().toLowerCase();
+        if (['none', 'absent', 'no', 'very low'].includes(label)) return 0;
+        if (['low', 'weak'].includes(label)) return 0.25;
+        if (['medium', 'moderate', 'mixed', 'partial'].includes(label)) return 0.5;
+        if (['high', 'strong'].includes(label)) return 0.75;
+        if (['very high', 'excellent', 'perfect'].includes(label)) return 1;
+    }
     const score = Number(value);
     return Number.isFinite(score) ? Math.round(Math.min(1, Math.max(0, score)) * 1000) / 1000 : fallback;
 };
+
+function parseAnalysis(content: string): any | null {
+    try {
+        const jsonMatch = content.match(/```json\n([\s\S]+?)\n```/) || content.match(/\{[\s\S]+\}/);
+        const jsonStr = jsonMatch ? (jsonMatch[1] || jsonMatch[0]) : content;
+        const parsed = JSON.parse(jsonStr);
+        if (!parsed || typeof parsed !== 'object') return null;
+        if (!Array.isArray(parsed.themes)) parsed.themes = [];
+        if (!Array.isArray(parsed.quotes)) parsed.quotes = [];
+        if (typeof parsed.sentiment !== 'string') parsed.sentiment = 'Good';
+        if (typeof parsed.category !== 'string') return null;
+        if (!Number.isFinite(normalizedScore(parsed.purity, NaN)) || !Number.isFinite(normalizedScore(parsed.intent_match, NaN))) return null;
+        return parsed;
+    } catch {
+        return null;
+    }
+}
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
     // CORS headers
@@ -138,82 +164,98 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             `[${idx + 1}] Points: ${r.points || r.rating || r.Rating}\nTitle: ${r.title || 'Unknown'}\n${r.text || r.description || r.excerpt}`
         ).join('\n\n');
 
-        // Call Analyzer Agent (LLM)
         console.log(`[Analyzer] Analyzing ${reviews.length} reviews in circle (${region.center_x}, ${region.center_y}, r=${region.radius})`);
 
-        const llmResponse = await fetch(OPENROUTER_API_URL, {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${apiKey}`,
-                'Content-Type': 'application/json',
-                'HTTP-Referer': req.headers.referer as string || req.headers.origin as string || 'https://localhost',
-                'X-Title': 'Wine Review Analyzer Agent'
-            },
-            body: JSON.stringify({
-                model,
-                messages: [
-                    { role: 'system', content: ANALYZER_SYSTEM_PROMPT },
-                    { role: 'user', content: `User intent: ${String(intent || 'Open-ended wine theme discovery').slice(0, 500)}\n\nAnalyze these ${reviews.length} reviews and score both semantic purity and intent match independently:\n\n${reviewsText}` }
-                ],
-                temperature: 0.3,  // Low temp for consistent analysis
-                max_tokens: 700
-            })
-        });
+        const callAnalyzer = async (retry = false) => {
+            const llmResponse = await fetch(OPENROUTER_API_URL, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${apiKey}`,
+                    'Content-Type': 'application/json',
+                    'HTTP-Referer': req.headers.referer as string || req.headers.origin as string || 'https://localhost',
+                    'X-Title': 'Wine Review Analyzer Agent'
+                },
+                body: JSON.stringify({
+                    model,
+                    messages: [
+                        { role: 'system', content: ANALYZER_SYSTEM_PROMPT },
+                        { role: 'user', content: `${retry ? 'Retry: return only the required JSON object. Do not add explanations.\n\n' : ''}User intent: ${String(intent || 'Open-ended wine theme discovery').slice(0, 500)}\n\nAnalyze these ${reviews.length} sampled reviews. If evidence is broad or mixed, return lower purity/intent_match rather than failing.\n\n${reviewsText}` }
+                    ],
+                    temperature: retry ? 0 : 0.2,
+                    max_tokens: 900,
+                    response_format: { type: 'json_object' },
+                    include_reasoning: false,
+                    reasoning: { exclude: true }
+                })
+            });
+            if (!llmResponse.ok) {
+                const errorText = await llmResponse.text();
+                console.error('[Analyzer] LLM error:', llmResponse.status, errorText);
+                throw new Error(`Analyzer Agent failed: ${llmResponse.statusText}`);
+            }
+            return await llmResponse.json();
+        };
 
-        if (!llmResponse.ok) {
-            const errorText = await llmResponse.text();
-            console.error('[Analyzer] LLM error:', llmResponse.status, errorText);
-            return res.status(llmResponse.status).json({
-                error: `Analyzer Agent failed: ${llmResponse.statusText}`
+        let llmData: any;
+        try {
+            llmData = await callAnalyzer(false);
+        } catch (error) {
+            return res.status(502).json({
+                error: error instanceof Error ? error.message : 'Analyzer Agent failed'
             });
         }
 
-        const llmData = await llmResponse.json();
+        const extractContent = (data: any): string => {
+            const message = data.choices?.[0]?.message;
+            let content = message?.content;
+            if (!content && message?.reasoning_details) {
+                content = message.reasoning_details.map((d: any) => d.content).join('\n');
+            }
+            return content || '';
+        };
+
+        let content = extractContent(llmData);
+        let analysis = parseAnalysis(content);
+        if (!analysis) {
+            console.warn('[Analyzer] Invalid JSON on first pass; retrying once.');
+            llmData = await callAnalyzer(true);
+            content = extractContent(llmData);
+            analysis = parseAnalysis(content);
+        }
+
+        if (!analysis) {
+            console.error('[Analyzer] Failed to parse valid LLM JSON after retry:', content);
+            const failedResponse: AnalyzerResponse & { analyzer_usage?: unknown } = {
+                category: 'Analysis failed',
+                sentiment: 'N/A',
+                themes: [],
+                quotes: [],
+                count: reviews.length,
+                avg_points: Math.round(avg_points * 10) / 10,
+                review_ids: reviews.map((r: any) => r.id || r.__row_index__).filter((id: any) => id !== undefined),
+                region_id: region.id,
+                center_x: region.center_x,
+                center_y: region.center_y,
+                radius: region.radius,
+                purity: 0,
+                purity_rationale: 'Analyzer did not return valid structured evidence after retry.',
+                intent_match: 0,
+                intent_match_rationale: 'Analyzer did not return valid structured evidence after retry.',
+                outlier_count: reviews.length,
+                analysis_failed: true,
+                analyzer_usage: llmData?.usage
+            };
+            return res.status(200).json(failedResponse);
+        }
+
+        console.log('[Analyzer] Extracted content:', content.substring(0, 200) + '...');
+
         console.log('[Analyzer] LLM response:', {
             hasChoices: !!llmData.choices,
             choicesLength: llmData.choices?.length,
             firstChoice: llmData.choices?.[0],
             message: llmData.choices?.[0]?.message
         });
-        
-        // Handle both standard and reasoning token responses
-        const message = llmData.choices?.[0]?.message;
-        let content = message?.content;
-        
-        // If content is empty but there are reasoning_details, try to extract from there
-        if (!content && message?.reasoning_details) {
-            content = message.reasoning_details.map((d: any) => d.content).join('\n');
-        }
-
-        if (!content) {
-            console.error('[Analyzer] No content in response. Message object:', message);
-            return res.status(500).json({ error: 'No response from Analyzer Agent' });
-        }
-        
-        console.log('[Analyzer] Extracted content:', content.substring(0, 200) + '...');
-
-        // Parse JSON from LLM response
-        let analysis: any;
-        try {
-            // Try to extract JSON from markdown code blocks if present
-            const jsonMatch = content.match(/```json\n([\s\S]+?)\n```/) || content.match(/\{[\s\S]+\}/);
-            const jsonStr = jsonMatch ? (jsonMatch[1] || jsonMatch[0]) : content;
-            analysis = JSON.parse(jsonStr);
-        } catch {
-            console.error('[Analyzer] Failed to parse LLM JSON:', content);
-            // Fallback: create a basic analysis
-            analysis = {
-                category: 'General Wines',
-                sentiment: avg_points >= 88 ? 'Excellent' : 'Good',
-                themes: ['Various Styles'],
-                quotes: [],
-                purity: 0.5,
-                purity_rationale: 'Structured analysis was unavailable; neutral fallback used.',
-                intent_match: 0.5,
-                intent_match_rationale: 'Structured analysis was unavailable; neutral fallback used.',
-                outlier_count: 0
-            };
-        }
 
         const response: AnalyzerResponse = {
             category: analysis.category || 'Unknown',

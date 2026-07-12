@@ -76,12 +76,17 @@ export const TOOL_DEFINITIONS = [
         type: 'function' as const,
         function: {
             name: 'refine_region',
-            description: 'Zoom into one promising circular region and propose smaller dense child regions. Use when an inspected region is relevant but broad or mixed.',
+            description: 'Zoom into one promising circular region and propose smaller child regions for projection-guided purification. Use when an inspected region is relevant but broad, mixed, or needs distinct subthemes.',
             parameters: {
                 type: 'object',
                 properties: {
                     parent_id: { type: 'string', description: 'ID of an inspected candidate whose policy recommendation is refine or explore.' },
                     center_x: { type: 'number' }, center_y: { type: 'number' }, radius: { type: 'number' },
+                    objective: {
+                        type: 'string',
+                        enum: ['maximize_purity', 'maximize_intent_match', 'find_distinct_subthemes'],
+                        description: 'Refinement goal. Use maximize_purity for mixed relevant regions, maximize_intent_match for weakly relevant regions, and find_distinct_subthemes when the user asks for diverse themes.'
+                    },
                     subdivisions: { type: 'number', description: 'Cells across the parent diameter; default 4, range 2-10.' },
                     top_k: { type: 'number', description: 'Child regions to return; default 6, maximum 12.' }
                 },

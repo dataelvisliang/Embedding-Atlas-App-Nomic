@@ -231,11 +231,14 @@ export class ToolExecutor {
         return Math.round((inside / coordinates.length) * 1000) / 1000;
     }
 
-    private async refineRegion(callId: string, args: RegionProbe & { parent_id?: string; subdivisions?: number; top_k?: number }): Promise<ToolResult> {
+    private async refineRegion(callId: string, args: RegionProbe & { parent_id?: string; objective?: string; subdivisions?: number; top_k?: number }): Promise<ToolResult> {
         const parent: RegionProbe = {
             center_x: finite(args.center_x, 0), center_y: finite(args.center_y, 0),
             radius: clamp(args.radius, 1, 0.0001, 100000)
         };
+        const objective = ['maximize_purity', 'maximize_intent_match', 'find_distinct_subthemes'].includes(String(args.objective))
+            ? String(args.objective)
+            : 'maximize_purity';
         const subdivisions = Math.floor(clamp(args.subdivisions, 4, 2, 10));
         const topK = Math.floor(clamp(args.top_k, 6, 1, 12));
         const cellSize = (parent.radius * 2) / subdivisions;
@@ -244,20 +247,45 @@ export class ToolExecutor {
         const rows = await this.query(`
             SELECT FLOOR((projection_x - ${originX}) / ${cellSize}) AS cell_x,
                    FLOOR((projection_y - ${originY}) / ${cellSize}) AS cell_y,
-                   COUNT(*) AS density, AVG(points) AS avg_points
+                   COUNT(*) AS density, AVG(points) AS avg_points, AVG(price) AS avg_price,
+                   COUNT(DISTINCT variety) AS variety_count, COUNT(DISTINCT country) AS country_count
             FROM reviews
             WHERE ${circlePredicate(parent)}
             GROUP BY cell_x, cell_y ORDER BY density DESC LIMIT ${topK}
         `);
-        const children = rows.map((row, index) => ({
-            id: `${args.parent_id || args.id || 'refined'}-${index + 1}`,
-            center_x: originX + (Number(row.cell_x) + 0.5) * cellSize,
-            center_y: originY + (Number(row.cell_y) + 0.5) * cellSize,
-            suggested_radius: cellSize * Math.SQRT1_2,
-            density: Number(row.density),
-            avg_points: row.avg_points == null ? null : Number(row.avg_points).toFixed(1)
+        const children = await Promise.all(rows.map(async (row, index) => {
+            const child = {
+                id: `${args.parent_id || args.id || 'refined'}-${index + 1}`,
+                center_x: originX + (Number(row.cell_x) + 0.5) * cellSize,
+                center_y: originY + (Number(row.cell_y) + 0.5) * cellSize,
+                radius: cellSize * Math.SQRT1_2,
+                suggested_radius: cellSize * Math.SQRT1_2
+            };
+            const predicate = circlePredicate(child);
+            const dominantVarieties = await this.query(`
+                SELECT variety, COUNT(*) AS count FROM reviews
+                WHERE ${predicate} AND variety IS NOT NULL
+                GROUP BY variety ORDER BY count DESC LIMIT 4
+            `);
+            const dominantCountries = await this.query(`
+                SELECT country, COUNT(*) AS count FROM reviews
+                WHERE ${predicate} AND country IS NOT NULL
+                GROUP BY country ORDER BY count DESC LIMIT 4
+            `);
+            return {
+                ...child,
+                objective,
+                parent_overlap: 1,
+                density: Number(row.density),
+                avg_points: row.avg_points == null ? null : Number(row.avg_points).toFixed(1),
+                avg_price: row.avg_price == null ? null : Number(row.avg_price).toFixed(2),
+                variety_count: Number(row.variety_count || 0),
+                country_count: Number(row.country_count || 0),
+                dominant_varieties: dominantVarieties,
+                dominant_countries: dominantCountries
+            };
         }));
-        return { name: 'refine_region', call_id: callId, result: { parent, strategy: 'coarse_to_fine', children } };
+        return { name: 'refine_region', call_id: callId, result: { parent, objective, strategy: 'projection_guided_purification', children } };
     }
 
     private async compareRegions(callId: string, regions: RegionProbe[]): Promise<ToolResult> {
