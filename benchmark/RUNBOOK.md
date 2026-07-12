@@ -10,6 +10,24 @@ Run every system on the same query split and seeds `17`, `29`, and `43`. Enforce
 
 Write one JSON object per `(query_id, system_id, seed)` to `benchmark/runs/<system_id>.jsonl`. The format is defined in `schemas/run.schema.json`.
 
+### Development-only PAR pilot
+
+Before freezing a PAR configuration, run the repeatable pilot on development queries only:
+
+```powershell
+python benchmark/scripts/run_par_pilot.py --query-ids wine-dev-005 wine-dev-006 wine-dev-010 --sample-size 4 --max-steps 5
+```
+
+The expected trajectory is `scan_regions -> inspect_regions` followed by optional `refine_region`, then a stop/final answer. Use the pilot outputs to inspect `accepted`, `rejected`, `frontier`, `purity`, `intent_match`, `tokens`, `latency`, and `cost_usd`.
+
+To debug thresholds without polluting the blind benchmark pool, prepare a calibration sheet from a pilot run:
+
+```powershell
+python benchmark/scripts/prepare_pilot_calibration.py --run benchmark/runs/pilot/par_pilot_20260712T153808Z.jsonl --output-jsonl benchmark/reports/pilot_calibration_20260712T153808Z.jsonl --output-md benchmark/reports/pilot_calibration_20260712T153808Z.md
+```
+
+Calibration sheets may show model scores and recommended actions because they are for development diagnosis. Do not use them as final blind labels.
+
 For `par_v1`, download the completed chat, then convert it:
 
 ```powershell

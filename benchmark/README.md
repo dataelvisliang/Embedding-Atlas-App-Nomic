@@ -12,6 +12,17 @@ python benchmark/scripts/pool_candidates.py --runs benchmark/runs --output bench
 python benchmark/metrics/evaluate.py --runs benchmark/runs --judgments benchmark/annotations/judgments.jsonl --output benchmark/reports/results.json
 ```
 
+## PAR pilot runner
+
+Before creating final blind labels, use the pilot runner on development queries to verify that the agentic projection-search loop is actually reproducible:
+
+```powershell
+python benchmark/scripts/run_par_pilot.py --query-ids wine-dev-005 wine-dev-006 wine-dev-010 --sample-size 4 --max-steps 5
+python benchmark/scripts/prepare_pilot_calibration.py --run benchmark/runs/pilot/par_pilot_20260712T153808Z.jsonl --output-jsonl benchmark/reports/pilot_calibration_20260712T153808Z.jsonl --output-md benchmark/reports/pilot_calibration_20260712T153808Z.md
+```
+
+The pilot JSONL exposes `query_id`, `tool_sequence`, `accepted`, `rejected`, `frontier`, `purity`, `intent_match`, `stop_reason`, `final_answer`, `tokens`, `latency`, and `cost_usd` for quick trajectory inspection. Pilot calibration sheets are not blind evaluation artifacts; they are for debugging thresholds and analyzer behavior before formal annotation.
+
 Do not tune utility weights, purity thresholds, prompts, or budgets on the test split. Any system change after observing test results requires a new benchmark version.
 
 See [ANNOTATION_GUIDE.md](ANNOTATION_GUIDE.md) for blind labeling and [RUNBOOK.md](RUNBOOK.md) for the experiment protocol.
