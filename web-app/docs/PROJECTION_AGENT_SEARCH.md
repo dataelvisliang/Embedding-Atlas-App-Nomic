@@ -18,6 +18,18 @@ Points that are close in the 2D projection are candidates for semantic similarit
 
 This workflow is agentic when later probes depend on earlier observations. A fixed one-shot batch of circles is parallel spatial retrieval, not the complete agentic loop.
 
+## SearchContext contract
+
+Every retrieval or spatial tool runs inside one controller-owned `SearchContext` rather than independently reinterpreting the user request. It carries executable `hard_filters`, the `semantic_intent`, projection state, and evidence state.
+
+For every spatial operation:
+
+```text
+eligible_points = spatial_scope ∩ hard_filters
+```
+
+Therefore `scan_regions`, `inspect_regions`, `refine_region`, and `compare_regions` cannot reintroduce records excluded by price or metadata constraints. Results expose `context_applied`, and reported density is eligible density under that context.
+
 ## Enforced search policy
 
 `SearchPolicy` makes the traversal reproducible instead of relying on prompt compliance. Each user request starts a fresh policy session with these default ceilings:

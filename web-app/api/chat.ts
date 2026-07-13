@@ -48,7 +48,8 @@ export default async function handler(
       },
       body: JSON.stringify({
         model: model || defaultModel,
-        messages: messages
+        messages: messages,
+        reasoning: { effort: 'none', exclude: true }
       })
     });
 

@@ -33,7 +33,8 @@ def chat_with_openrouter(messages, model="nvidia/nemotron-3-nano-30b-a3b:free"):
     
     payload = {
         "model": model,
-        "messages": messages
+        "messages": messages,
+        "reasoning": {"effort": "none", "exclude": True}
     }
     
     try:

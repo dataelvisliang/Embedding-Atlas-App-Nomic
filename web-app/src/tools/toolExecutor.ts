@@ -16,7 +16,7 @@ export interface ToolResult {
     error?: string;
 }
 
-interface SearchFilters {
+export interface SearchFilters {
     terms?: string[];
     term_mode?: 'AND' | 'OR';
     countries?: string[];
@@ -25,6 +25,14 @@ interface SearchFilters {
     max_points?: number;
     min_price?: number;
     max_price?: number;
+}
+
+export interface SearchContext {
+    version: 1;
+    hard_filters: SearchFilters;
+    semantic_intent: string;
+    projection_state?: { visited_region_ids?: string[]; refinement_depth?: number };
+    evidence_state?: { accepted_region_ids?: string[]; frontier_region_ids?: string[] };
 }
 
 interface RegionProbe {
@@ -54,11 +62,40 @@ function filterClause(filters: SearchFilters = {}): string {
     return conditions.length ? ` WHERE ${conditions.join(' AND ')}` : '';
 }
 
+function contextFromArgs(args: SearchFilters & { search_context?: unknown }): SearchContext | null {
+    const value = args.search_context;
+    if (!value || typeof value !== 'object') return null;
+    const context = value as Partial<SearchContext>;
+    if (!context.hard_filters || typeof context.hard_filters !== 'object') return null;
+    return {
+        version: 1,
+        hard_filters: context.hard_filters,
+        semantic_intent: typeof context.semantic_intent === 'string' ? context.semantic_intent : '',
+        projection_state: context.projection_state,
+        evidence_state: context.evidence_state
+    };
+}
+
+function effectiveFilters(args: SearchFilters & { search_context?: unknown }): SearchFilters {
+    const context = contextFromArgs(args);
+    // Context-owned constraints win over agent-provided ad-hoc arguments.
+    return context ? { ...args, ...context.hard_filters } : args;
+}
+
+function appliedContext(args: SearchFilters & { search_context?: unknown }): SearchContext | null {
+    return contextFromArgs(args);
+}
+
 function circlePredicate(region: RegionProbe): string {
     const x = finite(region.center_x, 0);
     const y = finite(region.center_y, 0);
     const radius = clamp(region.radius, 1, 0.0001, 100000);
     return `(projection_x - ${x}) * (projection_x - ${x}) + (projection_y - ${y}) * (projection_y - ${y}) <= ${radius * radius}`;
+}
+
+function scopedPredicate(region: RegionProbe, filters: SearchFilters = {}): string {
+    const filtersSql = filterClause(filters);
+    return `${circlePredicate(region)}${filtersSql ? ` AND ${filtersSql.slice(' WHERE '.length)}` : ''}`;
 }
 
 function normalizeRows(rows: any[]): any[] {
@@ -88,9 +125,9 @@ export class ToolExecutor {
             switch (name) {
                 case 'search_reviews': return await this.searchReviews(toolCall.id, args);
                 case 'scan_regions': return await this.scanRegions(toolCall.id, args);
-                case 'inspect_regions': return await this.inspectRegions(toolCall.id, args.regions, args.intent, args.sample_size);
+                case 'inspect_regions': return await this.inspectRegions(toolCall.id, args);
                 case 'refine_region': return await this.refineRegion(toolCall.id, args);
-                case 'compare_regions': return await this.compareRegions(toolCall.id, args.regions);
+                case 'compare_regions': return await this.compareRegions(toolCall.id, args);
                 case 'save_results': return this.saveResults(toolCall.id, args.review_ids, args.category);
                 default: return { name, call_id: toolCall.id, result: null, error: `Unknown tool: ${name}` };
             }
@@ -106,7 +143,8 @@ export class ToolExecutor {
 
     private async searchReviews(callId: string, args: SearchFilters & { limit?: number }): Promise<ToolResult> {
         const limit = Math.floor(clamp(args.limit, 15, 1, 50));
-        const where = filterClause(args);
+        const filters = effectiveFilters(args);
+        const where = filterClause(filters);
         const rows = await this.query(`
             SELECT __row_index__, points, description, title, price, variety, country, projection_x, projection_y
             FROM reviews${where}
@@ -119,6 +157,7 @@ export class ToolExecutor {
             result: {
                 total_matches: Number(countRows[0]?.total || 0),
                 matches_returned: rows.length,
+                context_applied: appliedContext(args),
                 reviews: rows.map(row => ({
                     id: row.__row_index__, points: row.points, title: row.title, price: row.price,
                     variety: row.variety, country: row.country,
@@ -138,7 +177,7 @@ export class ToolExecutor {
                    COUNT(*) AS density,
                    AVG(points) AS avg_points,
                    AVG(price) AS avg_price
-            FROM reviews${filterClause(args)}
+            FROM reviews${filterClause(effectiveFilters(args))}
             GROUP BY bin_x, bin_y
             ORDER BY density DESC
             LIMIT ${topK}
@@ -153,26 +192,29 @@ export class ToolExecutor {
             avg_points: row.avg_points == null ? null : Number(row.avg_points).toFixed(1),
             avg_price: row.avg_price == null ? null : Number(row.avg_price).toFixed(2)
         }));
-        return { name: 'scan_regions', call_id: callId, result: { strategy: 'coarse_grid_scan', regions } };
+        return { name: 'scan_regions', call_id: callId, result: { strategy: 'coarse_grid_scan', context_applied: appliedContext(args), regions } };
     }
 
-    private async inspectRegions(callId: string, regions: RegionProbe[], intentValue: unknown, sampleSizeValue?: number): Promise<ToolResult> {
+    private async inspectRegions(callId: string, args: SearchFilters & { regions?: RegionProbe[]; intent?: unknown; sample_size?: unknown }): Promise<ToolResult> {
+        const regions = args.regions;
+        const intentValue = args.intent;
+        const sampleSizeValue = args.sample_size;
         if (!Array.isArray(regions) || regions.length === 0) throw new Error('regions must contain at least one circular probe');
         const probes = regions.slice(0, 8);
         const sampleSize = Math.floor(clamp(sampleSizeValue, 12, 3, 50));
         const intent = String(intentValue || 'Open-ended wine theme discovery').trim().slice(0, 500);
-        const analyses = await Promise.all(probes.map((region, index) => this.inspectOneRegion(region, index, sampleSize, intent)));
-        return { name: 'inspect_regions', call_id: callId, result: { strategy: 'parallel_circular_probes', intent, regions: analyses } };
+        const analyses = await Promise.all(probes.map((region, index) => this.inspectOneRegion(region, index, sampleSize, intent, args)));
+        return { name: 'inspect_regions', call_id: callId, result: { strategy: 'parallel_circular_probes', intent, context_applied: appliedContext(args), regions: analyses } };
     }
 
-    private async inspectOneRegion(region: RegionProbe, index: number, sampleSize: number, intent: string): Promise<any> {
+    private async inspectOneRegion(region: RegionProbe, index: number, sampleSize: number, intent: string, filters: SearchFilters): Promise<any> {
         const probe = {
             id: region.id || `probe-${index + 1}`,
             center_x: finite(region.center_x, 0),
             center_y: finite(region.center_y, 0),
             radius: clamp(region.radius, 1, 0.0001, 100000)
         };
-        const predicate = circlePredicate(probe);
+        const predicate = scopedPredicate(probe, effectiveFilters(filters));
         const countRows = await this.query(`SELECT COUNT(*) AS density FROM reviews WHERE ${predicate}`);
         const rows = await this.query(`
             SELECT __row_index__, points, description, title, price, variety, country, projection_x, projection_y, neighbors
@@ -231,7 +273,7 @@ export class ToolExecutor {
         return Math.round((inside / coordinates.length) * 1000) / 1000;
     }
 
-    private async refineRegion(callId: string, args: RegionProbe & { parent_id?: string; objective?: string; subdivisions?: number; top_k?: number }): Promise<ToolResult> {
+    private async refineRegion(callId: string, args: SearchFilters & RegionProbe & { parent_id?: string; objective?: string; subdivisions?: number; top_k?: number }): Promise<ToolResult> {
         const parent: RegionProbe = {
             center_x: finite(args.center_x, 0), center_y: finite(args.center_y, 0),
             radius: clamp(args.radius, 1, 0.0001, 100000)
@@ -250,7 +292,7 @@ export class ToolExecutor {
                    COUNT(*) AS density, AVG(points) AS avg_points, AVG(price) AS avg_price,
                    COUNT(DISTINCT variety) AS variety_count, COUNT(DISTINCT country) AS country_count
             FROM reviews
-            WHERE ${circlePredicate(parent)}
+            WHERE ${scopedPredicate(parent, effectiveFilters(args))}
             GROUP BY cell_x, cell_y ORDER BY density DESC LIMIT ${topK}
         `);
         const children = await Promise.all(rows.map(async (row, index) => {
@@ -261,7 +303,7 @@ export class ToolExecutor {
                 radius: cellSize * Math.SQRT1_2,
                 suggested_radius: cellSize * Math.SQRT1_2
             };
-            const predicate = circlePredicate(child);
+            const predicate = scopedPredicate(child, effectiveFilters(args));
             const dominantVarieties = await this.query(`
                 SELECT variety, COUNT(*) AS count FROM reviews
                 WHERE ${predicate} AND variety IS NOT NULL
@@ -285,14 +327,15 @@ export class ToolExecutor {
                 dominant_countries: dominantCountries
             };
         }));
-        return { name: 'refine_region', call_id: callId, result: { parent, objective, strategy: 'projection_guided_purification', children } };
+        return { name: 'refine_region', call_id: callId, result: { parent, objective, strategy: 'projection_guided_purification', context_applied: appliedContext(args), children } };
     }
 
-    private async compareRegions(callId: string, regions: RegionProbe[]): Promise<ToolResult> {
+    private async compareRegions(callId: string, args: SearchFilters & { regions?: RegionProbe[] }): Promise<ToolResult> {
+        const regions = args.regions;
         if (!Array.isArray(regions) || regions.length < 2) throw new Error('compare_regions requires at least two regions');
         const comparisons = await Promise.all(regions.slice(0, 6).map(async (region, index) => {
             const probe = { id: region.id || `region-${index + 1}`, center_x: finite(region.center_x, 0), center_y: finite(region.center_y, 0), radius: clamp(region.radius, 1, 0.0001, 100000) };
-            const predicate = circlePredicate(probe);
+            const predicate = scopedPredicate(probe, effectiveFilters(args));
             const [summary] = await this.query(`
                 SELECT COUNT(*) AS density, AVG(points) AS avg_points, AVG(price) AS avg_price,
                        MIN(points) AS min_points, MAX(points) AS max_points
@@ -304,7 +347,7 @@ export class ToolExecutor {
             `);
             return { ...probe, ...summary, dominant_country_varieties: categories };
         }));
-        return { name: 'compare_regions', call_id: callId, result: { regions: comparisons } };
+        return { name: 'compare_regions', call_id: callId, result: { context_applied: appliedContext(args), regions: comparisons } };
     }
 
     private saveResults(callId: string, reviewIds: number[], category: string): ToolResult {

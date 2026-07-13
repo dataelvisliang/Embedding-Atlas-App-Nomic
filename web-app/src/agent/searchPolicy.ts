@@ -7,6 +7,14 @@ interface Region {
     radius: number;
 }
 
+type RegionSource = 'scan' | 'refine' | 'resample';
+
+interface AuthorizedRegion extends Region {
+    id: string;
+    source: RegionSource;
+    parent_id?: string;
+}
+
 interface PolicyLimits {
     maxToolCalls: number;
     maxScans: number;
@@ -49,6 +57,7 @@ export interface CandidateAssessment extends Region {
     themes: string[];
     purity: number;
     intent_match: number;
+    hard_constraint_match: boolean;
     novelty: number;
     coverage_gain: number;
     confidence: number;
@@ -67,7 +76,7 @@ export interface CandidateAssessment extends Region {
 export interface SearchPolicySnapshot {
     must_stop: boolean;
     stop_reason: string | null;
-    objective: { target_accepted_regions: number; requires_comparison: boolean; exploration: boolean };
+    objective: { target_accepted_regions: number; requires_comparison: boolean; exploration: boolean; has_hard_constraints: boolean; structured_filters: Record<string, number> };
     remaining: PolicyCounters;
     inspected_region_count: number;
     accepted_region_count: number;
@@ -148,13 +157,44 @@ function frontierAction(action: CandidateAction): boolean {
     return ['refine', 'resample', 'compare', 'explore'].includes(action);
 }
 
+function hasHardConstraints(objective: string): boolean {
+    return /\b(red|white|rosé|rose|sparkling|under\s*\$?\d+|over\s*\$?\d+|less than\s*\$?\d+|more than\s*\$?\d+|from\s+[A-Z][a-z]+|only)\b|红葡萄酒|白葡萄酒|桃红|起泡|低于\s*\$?\d+|高于\s*\$?\d+/i.test(objective);
+}
+
+function extractStructuredFilters(objective: string): Record<string, number> {
+    const filters: Record<string, number> = {};
+    const maxMatch = objective.match(/\b(?:under|below|less than)\s*\$?(\d+(?:\.\d+)?)|低于\s*\$?(\d+(?:\.\d+)?)/i);
+    const minMatch = objective.match(/\b(?:over|above|more than)\s*\$?(\d+(?:\.\d+)?)|高于\s*\$?(\d+(?:\.\d+)?)/i);
+    const matchedNumber = (match: RegExpMatchArray | null): number | null => {
+        const value = match?.slice(1).find(Boolean);
+        return value == null ? null : Number(value);
+    };
+    const maxPrice = matchedNumber(maxMatch);
+    const minPrice = matchedNumber(minMatch);
+    if (Number.isFinite(maxPrice)) filters.max_price = maxPrice as number;
+    if (Number.isFinite(minPrice)) filters.min_price = minPrice as number;
+    return filters;
+}
+
+function violatesObviousConstraint(objective: string, themes: string[]): boolean {
+    const query = objective.toLowerCase();
+    const evidence = themes.join(' ').toLowerCase();
+    const asksRed = /\bred(?:\s+wines?)?\b|红葡萄酒/i.test(query);
+    const asksWhite = /\bwhite(?:\s+wines?)?\b|白葡萄酒/i.test(query);
+    const hasRed = /\bred\b|红/i.test(evidence);
+    const hasWhite = /\bwhite\b|白/i.test(evidence);
+    return (asksRed && !asksWhite && hasWhite && !hasRed) || (asksWhite && !asksRed && hasRed && !hasWhite);
+}
+
 export class SearchPolicy {
     private limits: PolicyLimits;
     private counters: PolicyCounters = {
         toolCalls: 0, scans: 0, searches: 0, inspectedRegions: 0,
         refinements: 0, comparisons: 0, savedCategories: 0, modelTokens: 0
     };
-    private objective: { targetAcceptedRegions: number; requiresComparison: boolean; exploration: boolean };
+    private objective: { targetAcceptedRegions: number; requiresComparison: boolean; exploration: boolean; hasHardConstraints: boolean };
+    private objectiveText: string;
+    private structuredFilters: Record<string, number>;
     private visitedRegions: Region[] = [];
     private scanSignatures = new Set<string>();
     private refinementSignatures = new Set<string>();
@@ -163,6 +203,7 @@ export class SearchPolicy {
     private discoveredThemes = new Set<string>();
     private relevantThemes = new Set<string>();
     private candidates = new Map<string, CandidateAssessment>();
+    private authorizedRegions = new Map<string, AuthorizedRegion>();
     private resampledCandidates = new Set<string>();
     private noProgressRounds = 0;
     private probeRounds = 0;
@@ -174,8 +215,11 @@ export class SearchPolicy {
 
     constructor(limits: Partial<PolicyLimits> = {}, objective = '') {
         this.limits = { ...DEFAULT_LIMITS, ...limits };
+        this.objectiveText = objective;
+        this.structuredFilters = extractStructuredFilters(objective);
         this.objective = {
             targetAcceptedRegions: requestedResultCount(objective),
+            hasHardConstraints: hasHardConstraints(objective),
             exploration: /\b(explore|discover|find|map|regions?|themes?|styles?|different|distinct|diverse|unusual|open-ended)\b|探索|发现|地图|区域|主题|风格|不同|多样|少见/i.test(objective),
             requiresComparison: /\b(compare|comparison|difference|different|versus|vs\.?)\b|比较|对比|差异/i.test(objective)
         };
@@ -206,13 +250,25 @@ export class SearchPolicy {
             this.addEvent(result.name, 'failed', result.error);
             return;
         }
+        if (result.name === 'scan_regions') {
+            const regions = (result.result as { regions?: unknown[] } | null)?.regions || [];
+            for (const item of regions) this.registerAuthorizedRegion(item, 'scan');
+            this.addEvent(result.name, 'completed');
+            return;
+        }
+        if (result.name === 'refine_region') {
+            const payload = result.result as { children?: unknown[]; parent?: { id?: string } } | null;
+            for (const item of payload?.children || []) this.registerAuthorizedRegion(item, 'refine', payload?.parent?.id);
+            this.addEvent(result.name, 'completed');
+            return;
+        }
         if (result.name !== 'inspect_regions') {
             this.addEvent(result.name, 'completed');
             return;
         }
 
         type ProbeResult = Region & {
-            id?: string; category?: unknown; themes?: unknown[]; purity?: unknown; intent_match?: unknown;
+            id?: string; category?: unknown; themes?: unknown[]; purity?: unknown; intent_match?: unknown; hard_constraint_match?: unknown;
             projection_agreement?: unknown; sample_size?: unknown; review_ids?: unknown[];
             analyzer_usage?: { total_tokens?: unknown };
             analysis_failed?: unknown;
@@ -245,7 +301,9 @@ export class SearchPolicy {
                 newPromisingCandidate = true;
             }
             const combinedThemes = [...new Set([...(prior?.themes || []), ...uniqueThemes])];
-            const acceptanceTier = analysisFailed ? null : this.acceptanceTier(intentMatch, purity, combinedThemes);
+            const hardConstraintMatch = !this.objective.hasHardConstraints ||
+                (region.hard_constraint_match !== false && !violatesObviousConstraint(this.objectiveText, combinedThemes));
+            const acceptanceTier = analysisFailed || !hardConstraintMatch ? null : this.acceptanceTier(intentMatch, purity, combinedThemes);
             if (!analysisFailed && (intentMatch >= 0.75 || acceptanceTier)) {
                 uniqueThemes.filter(theme => !relevantBefore.has(theme)).forEach(theme => newRelevantThemes.add(theme));
             }
@@ -259,7 +317,7 @@ export class SearchPolicy {
             const effectiveIntent = acceptanceTier ? Math.max(intentMatch, 0.75) : intentMatch;
             const rawUtility = analysisFailed ? 0 : 0.45 * effectiveIntent + 0.20 * purity + 0.15 * novelty + 0.10 * coverageGain + 0.10 * confidence - 0.05;
             const utility = clamp01(rawUtility);
-            const recommendedAction = analysisFailed ? 'reject' : this.recommend(intentMatch, purity, sampleRounds, acceptanceTier);
+            const recommendedAction = analysisFailed || !hardConstraintMatch ? 'reject' : this.recommend(intentMatch, purity, sampleRounds, acceptanceTier);
             const parentId = prior?.parent_id || this.findParentId(id);
             const parent = parentId ? this.candidates.get(parentId) : undefined;
             const refineDepth = prior?.refine_depth ?? (parent ? parent.refine_depth + 1 : 0);
@@ -267,6 +325,7 @@ export class SearchPolicy {
                 id, center_x: Number(region.center_x), center_y: Number(region.center_y), radius: Number(region.radius),
                 category: typeof region.category === 'string' ? region.category : prior?.category || 'Unknown', themes: combinedThemes,
                 purity: Math.round(purity * 1000) / 1000, intent_match: Math.round(intentMatch * 1000) / 1000,
+                hard_constraint_match: hardConstraintMatch,
                 novelty: Math.round(novelty * 1000) / 1000,
                 coverage_gain: Math.round(coverageGain * 1000) / 1000,
                 confidence: Math.round(confidence * 1000) / 1000,
@@ -305,7 +364,7 @@ export class SearchPolicy {
         return {
             must_stop: Boolean(this.stopReason),
             stop_reason: this.stopReason,
-            objective: { target_accepted_regions: this.objective.targetAcceptedRegions, requires_comparison: this.objective.requiresComparison, exploration: this.objective.exploration },
+            objective: { target_accepted_regions: this.objective.targetAcceptedRegions, requires_comparison: this.objective.requiresComparison, exploration: this.objective.exploration, has_hard_constraints: this.objective.hasHardConstraints, structured_filters: this.structuredFilters },
             remaining: {
                 toolCalls: Math.max(0, this.limits.maxToolCalls - this.counters.toolCalls),
                 scans: Math.max(0, this.limits.maxScans - this.counters.scans),
@@ -399,16 +458,18 @@ export class SearchPolicy {
         if (this.counters.scans >= this.limits.maxScans) return this.block(call, 'scan budget exhausted');
         this.scanSignatures.add(key);
         this.counters.scans++;
-        return this.accept(call);
+        return this.accept(this.injectStructuredFilters(call, args));
     }
 
     private evaluateSearch(call: ToolCall): PolicyDecision {
         if (this.counters.searches >= this.limits.maxSearches) return this.block(call, 'structured-search budget exhausted');
         this.counters.searches++;
-        return this.accept(call);
+        return this.accept(this.injectStructuredFilters(call, parseArguments(call)));
     }
 
     private evaluateInspection(call: ToolCall, args: Record<string, unknown>): PolicyDecision {
+        call = this.injectStructuredFilters(call, args);
+        args = parseArguments(call);
         const requested = Array.isArray(args.regions) ? args.regions.map(asRegion).filter((item): item is Region => item !== null) : [];
         if (!requested.length) return this.block(call, 'no valid circular probes supplied');
         if (typeof args.intent !== 'string' || !args.intent.trim()) return this.block(call, 'inspect_regions requires an explicit semantic intent');
@@ -420,16 +481,21 @@ export class SearchPolicy {
         const unique: Region[] = [];
         const requestedResamples = new Set(Array.isArray(args.resample_ids) ? args.resample_ids.map(String) : []);
         for (const region of requested) {
+            const id = region.id || '';
+            const authorized = this.authorizedRegions.get(id);
+            const canResample = Boolean(id && requestedResamples.has(id) && this.candidates.get(id)?.recommended_action === 'resample' && !this.resampledCandidates.has(id));
+            // Legacy/direct policy tests may begin with an inspection. Once a scan or
+            // refinement has produced candidates, provenance becomes mandatory.
+            if (this.authorizedRegions.size > 0 && !authorized && !canResample) continue;
+            if (authorized && !nearlySameCircle(authorized, region)) continue;
             const duplicate = [...this.visitedRegions, ...unique].some(previous => nearlySameCircle(previous, region));
-            const canResample = Boolean(region.id && requestedResamples.has(region.id) &&
-                this.candidates.get(region.id)?.recommended_action === 'resample' && !this.resampledCandidates.has(region.id));
             if (!duplicate || canResample) {
                 unique.push(region);
-                if (canResample && region.id) this.resampledCandidates.add(region.id);
+                if (canResample) this.resampledCandidates.add(id);
             }
         }
         const accepted = unique.slice(0, remaining);
-        if (!accepted.length) return this.block(call, 'all requested circles duplicate previously inspected regions');
+        if (!accepted.length) return this.block(call, 'every probe must use an authorized scan/refine/resample candidate ID and exact geometry');
         this.visitedRegions.push(...accepted);
         this.consecutiveBlockedActions = 0;
         this.counters.inspectedRegions += accepted.length;
@@ -440,6 +506,8 @@ export class SearchPolicy {
     }
 
     private evaluateRefinement(call: ToolCall, args: Record<string, unknown>): PolicyDecision {
+        call = this.injectStructuredFilters(call, args);
+        args = parseArguments(call);
         const parentId = typeof args.parent_id === 'string' ? args.parent_id : '';
         const candidate = this.candidates.get(parentId);
         if (!candidate) return this.block(call, 'refine_region requires parent_id from an inspected candidate');
@@ -458,6 +526,8 @@ export class SearchPolicy {
     }
 
     private evaluateComparison(call: ToolCall, args: Record<string, unknown>): PolicyDecision {
+        call = this.injectStructuredFilters(call, args);
+        args = parseArguments(call);
         const regions = Array.isArray(args.regions) ? args.regions : [];
         const ids = regions.map(region => region && typeof region === 'object' ? (region as Record<string, unknown>).id : null);
         if (ids.length < 2 || ids.some(id => typeof id !== 'string' || !this.candidates.has(id))) {
@@ -511,6 +581,30 @@ export class SearchPolicy {
         if (countsTowardToolBudget) this.counters.toolCalls++;
         this.addEvent(call.function.name, 'accepted', undefined, undefined, parseArguments(call));
         return { call };
+    }
+
+    private injectStructuredFilters(call: ToolCall, args: Record<string, unknown>): ToolCall {
+        const candidates = [...this.candidates.values()];
+        const context = {
+            version: 1,
+            hard_filters: this.structuredFilters,
+            semantic_intent: this.objectiveText,
+            projection_state: { visited_region_ids: this.visitedRegions.map(region => region.id).filter((id): id is string => Boolean(id)) },
+            evidence_state: {
+                accepted_region_ids: candidates.filter(candidate => candidate.recommended_action === 'accept').map(candidate => candidate.id),
+                frontier_region_ids: candidates.filter(candidate => frontierAction(candidate.recommended_action)).map(candidate => candidate.id)
+            }
+        };
+        const merged = { ...args, search_context: context };
+        if (JSON.stringify(args.search_context) === JSON.stringify(context)) return call;
+        return { ...call, function: { ...call.function, arguments: JSON.stringify(merged) } };
+    }
+
+    private registerAuthorizedRegion(value: unknown, source: RegionSource, parentId?: string): void {
+        const item = value && typeof value === 'object' ? value as Record<string, unknown> : null;
+        const region = asRegion(item ? { ...item, radius: item.radius ?? item.suggested_radius } : value);
+        if (!region?.id) return;
+        this.authorizedRegions.set(region.id, { ...region, id: region.id, source, parent_id: parentId });
     }
 
     private block(call: ToolCall, reason: string): PolicyDecision {

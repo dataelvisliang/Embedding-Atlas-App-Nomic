@@ -65,7 +65,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
                 'HTTP-Referer': String(req.headers.referer || req.headers.origin || 'https://localhost'),
                 'X-Title': 'Wine Review Atlas Agent'
             },
-            body: JSON.stringify({ model, messages: apiMessages, tools: TOOL_DEFINITIONS, tool_choice: 'auto' }),
+            body: JSON.stringify({
+                model,
+                messages: apiMessages,
+                tools: TOOL_DEFINITIONS,
+                tool_choice: 'auto',
+                temperature: 0,
+                max_tokens: 900,
+                reasoning: { effort: 'none', exclude: true }
+            }),
             signal: controller.signal
         });
         clearTimeout(timeout);

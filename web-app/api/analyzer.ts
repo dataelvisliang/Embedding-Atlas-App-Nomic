@@ -2,6 +2,23 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 
 const OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions";
 
+const ANALYZER_JSON_SCHEMA = {
+    name: 'wine_region_analysis',
+    strict: true,
+    schema: {
+        type: 'object', additionalProperties: false,
+        required: ['category', 'sentiment', 'themes', 'quotes', 'purity', 'purity_rationale', 'intent_match', 'intent_match_rationale', 'hard_constraint_match', 'outlier_count'],
+        properties: {
+            category: { type: 'string' }, sentiment: { type: 'string', enum: ['Excellent', 'Good', 'Mediocre'] },
+            themes: { type: 'array', items: { type: 'string' }, minItems: 0, maxItems: 5 },
+            quotes: { type: 'array', items: { type: 'string' }, minItems: 0, maxItems: 3 },
+            purity: { type: 'number', minimum: 0, maximum: 1 }, purity_rationale: { type: 'string' },
+            intent_match: { type: 'number', minimum: 0, maximum: 1 }, intent_match_rationale: { type: 'string' },
+            hard_constraint_match: { type: 'boolean' }, outlier_count: { type: 'integer', minimum: 0 }
+        }
+    }
+} as const;
+
 const ANALYZER_SYSTEM_PROMPT = `You are a specialized Wine Review Analyzer Agent.
 
 Your task is to analyze a set of wine reviews and extract:
@@ -29,10 +46,11 @@ Output only one JSON object with exactly these keys:
   "purity_rationale": "one short evidence-based sentence",
   "intent_match": 0.0,
   "intent_match_rationale": "one short evidence-based sentence",
+  "hard_constraint_match": true,
   "outlier_count": 0
 }
 
-If the sampled reviews are mixed, still choose the best concise category and lower the purity score. Score the supplied reviews only. Do not infer from coordinates or density. Be precise and data-driven. The category should be informative.`;
+If the sampled reviews are mixed, still choose the best concise category and lower the purity score. hard_constraint_match must be false if sampled evidence contradicts an explicit user requirement such as color, price, score, country, or variety. Score the supplied reviews only. Do not infer from coordinates or density. Be precise and data-driven. The category should be informative.`;
 
 interface AnalyzerRequest {
     region: {
@@ -61,7 +79,10 @@ interface AnalyzerResponse {
     purity_rationale: string;
     intent_match: number;
     intent_match_rationale: string;
+    hard_constraint_match: boolean | null;
     outlier_count: number;
+    analyzer_status?: string;
+    analyzer_attempts?: number;
     analysis_failed?: boolean;
 }
 
@@ -89,6 +110,7 @@ function parseAnalysis(content: string): any | null {
         if (typeof parsed.sentiment !== 'string') parsed.sentiment = 'Good';
         if (typeof parsed.category !== 'string') return null;
         if (!Number.isFinite(normalizedScore(parsed.purity, NaN)) || !Number.isFinite(normalizedScore(parsed.intent_match, NaN))) return null;
+        parsed.hard_constraint_match = typeof parsed.hard_constraint_match === 'boolean' ? parsed.hard_constraint_match : null;
         return parsed;
     } catch {
         return null;
@@ -149,6 +171,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
                 purity_rationale: 'The circle contains no reviews.',
                 intent_match: 0,
                 intent_match_rationale: 'No evidence is available for intent matching.',
+                hard_constraint_match: false,
                 outlier_count: 0
             });
         }
@@ -181,11 +204,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
                         { role: 'system', content: ANALYZER_SYSTEM_PROMPT },
                         { role: 'user', content: `${retry ? 'Retry: return only the required JSON object. Do not add explanations.\n\n' : ''}User intent: ${String(intent || 'Open-ended wine theme discovery').slice(0, 500)}\n\nAnalyze these ${reviews.length} sampled reviews. If evidence is broad or mixed, return lower purity/intent_match rather than failing.\n\n${reviewsText}` }
                     ],
-                    temperature: retry ? 0 : 0.2,
+                    temperature: 0,
                     max_tokens: 900,
-                    response_format: { type: 'json_object' },
-                    include_reasoning: false,
-                    reasoning: { exclude: true }
+                    response_format: { type: 'json_schema', json_schema: ANALYZER_JSON_SCHEMA },
+                    reasoning: { effort: 'none', exclude: true },
+                    plugins: [{ id: 'response-healing' }]
                 })
             });
             if (!llmResponse.ok) {
@@ -196,15 +219,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             return await llmResponse.json();
         };
 
-        let llmData: any;
-        try {
-            llmData = await callAnalyzer(false);
-        } catch (error) {
-            return res.status(502).json({
-                error: error instanceof Error ? error.message : 'Analyzer Agent failed'
-            });
-        }
-
         const extractContent = (data: any): string => {
             const message = data.choices?.[0]?.message;
             let content = message?.content;
@@ -214,13 +228,27 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             return content || '';
         };
 
-        let content = extractContent(llmData);
-        let analysis = parseAnalysis(content);
-        if (!analysis) {
-            console.warn('[Analyzer] Invalid JSON on first pass; retrying once.');
-            llmData = await callAnalyzer(true);
+        let llmData: any;
+        let content = '';
+        let analysis: any = null;
+        const failureReasons: string[] = [];
+        let attempts = 0;
+        for (let attempt = 0; attempt < 3; attempt++) {
+            attempts = attempt + 1;
+            try {
+                llmData = await callAnalyzer(attempt > 0);
+            } catch (error) {
+                failureReasons.push(`request_error:${error instanceof Error ? error.name : 'unknown'}`);
+                continue;
+            }
             content = extractContent(llmData);
+            if (!content.trim()) {
+                failureReasons.push('empty_content');
+                continue;
+            }
             analysis = parseAnalysis(content);
+            if (analysis) break;
+            failureReasons.push(content.includes('{') ? 'schema_invalid_or_malformed_json' : 'invalid_json');
         }
 
         if (!analysis) {
@@ -238,11 +266,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
                 center_y: region.center_y,
                 radius: region.radius,
                 purity: 0,
-                purity_rationale: 'Analyzer did not return valid structured evidence after retry.',
+                purity_rationale: `Analyzer failed after recovery attempts: ${failureReasons.slice(-3).join(', ') || 'unknown_failure'}.`,
                 intent_match: 0,
                 intent_match_rationale: 'Analyzer did not return valid structured evidence after retry.',
+                hard_constraint_match: false,
                 outlier_count: reviews.length,
                 analysis_failed: true,
+                analyzer_status: failureReasons.at(-1) || 'unknown_failure',
+                analyzer_attempts: attempts,
                 analyzer_usage: llmData?.usage
             };
             return res.status(200).json(failedResponse);
@@ -273,7 +304,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             purity_rationale: String(analysis.purity_rationale || 'No rationale returned.'),
             intent_match: normalizedScore(analysis.intent_match),
             intent_match_rationale: String(analysis.intent_match_rationale || 'No rationale returned.'),
-            outlier_count: Math.max(0, Math.min(reviews.length, Math.round(Number(analysis.outlier_count) || 0)))
+            hard_constraint_match: analysis.hard_constraint_match,
+            outlier_count: Math.max(0, Math.min(reviews.length, Math.round(Number(analysis.outlier_count) || 0))),
+            analyzer_status: 'ok',
+            analyzer_attempts: attempts
         };
 
         const responseWithUsage = {

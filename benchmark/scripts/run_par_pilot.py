@@ -34,6 +34,7 @@ import pandas as pd
 DEFAULT_QUERY_IDS = ["wine-dev-005", "wine-dev-006", "wine-dev-010"]
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 PILOT_WALL_CLOCK_MS = 300_000
+ANALYZER_JSON_SCHEMA = {"name": "wine_region_analysis", "strict": True, "schema": {"type": "object", "additionalProperties": False, "required": ["category", "sentiment", "themes", "quotes", "purity", "purity_rationale", "intent_match", "intent_match_rationale", "hard_constraint_match", "outlier_count"], "properties": {"category": {"type": "string"}, "sentiment": {"type": "string", "enum": ["Excellent", "Good", "Mediocre"]}, "themes": {"type": "array", "items": {"type": "string"}}, "quotes": {"type": "array", "items": {"type": "string"}}, "purity": {"type": "number", "minimum": 0, "maximum": 1}, "purity_rationale": {"type": "string"}, "intent_match": {"type": "number", "minimum": 0, "maximum": 1}, "intent_match_rationale": {"type": "string"}, "hard_constraint_match": {"type": "boolean"}, "outlier_count": {"type": "integer", "minimum": 0}}}}
 
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
@@ -194,13 +195,16 @@ Output only one JSON object with exactly these keys:
   "purity_rationale": "one evidence-based sentence",
   "intent_match": 0.0,
   "intent_match_rationale": "one evidence-based sentence",
+  "hard_constraint_match": true,
   "outlier_count": 0
 }
 
 Purity measures whether sampled reviews share one coherent wine theme.
 Intent match measures fit to the supplied user intent. If the sample is broad
 or mixed, still choose the best category and lower the scores. Score supplied
-reviews only; do not infer from coordinates or density.
+reviews only; do not infer from coordinates or density. hard_constraint_match
+must be false whenever a stated color, price, score, country, or variety
+constraint is contradicted by the sampled evidence.
 """
 
 
@@ -267,6 +271,8 @@ class OpenRouterClient:
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", "replace")
             raise RuntimeError(f"OpenRouter HTTP {error.code}: {detail[:1000]}") from error
+        except urllib.error.URLError as error:
+            raise RuntimeError(f"OpenRouter request failed after {self.timeout}s: {error.reason}") from error
 
 
 def score_value(value: Any, fallback: float = 0.5) -> float:
@@ -323,6 +329,7 @@ def normalize_analysis(parsed: dict[str, Any] | None) -> dict[str, Any] | None:
         return None
     parsed["purity"] = purity
     parsed["intent_match"] = intent_match
+    parsed["hard_constraint_match"] = parsed.get("hard_constraint_match") if isinstance(parsed.get("hard_constraint_match"), bool) else None
     return parsed
 
 
@@ -373,6 +380,9 @@ class AtlasTools:
         return {"name": name, "call_id": call["id"], "result": None, "error": "unknown tool"}
 
     def filter_mask(self, args: dict[str, Any]) -> pd.Series:
+        context = args.get("search_context") if isinstance(args.get("search_context"), dict) else {}
+        hard_filters = context.get("hard_filters") if isinstance(context.get("hard_filters"), dict) else {}
+        args = {**args, **hard_filters}
         mask = pd.Series(True, index=self.df.index)
         terms = [str(term).strip().lower() for term in args.get("terms", []) if str(term).strip()][:10]
         if terms:
@@ -468,7 +478,7 @@ class AtlasTools:
                 "radius": float(region.get("radius") or region.get("suggested_radius") or 1),
             }
             try:
-                subset = self.df[self.circle_mask(probe)]
+                subset = self.df[self.circle_mask(probe) & self.filter_mask(args)]
                 density = len(subset)
                 sample = subset.sample(n=min(sample_size, density), random_state=self.seed + index) if density else subset
                 reviews = [self.review_from_row(row) for _, row in sample.iterrows()]
@@ -523,7 +533,7 @@ class AtlasTools:
         cell = parent["radius"] * 2 / subdivisions
         origin_x = parent["center_x"] - parent["radius"]
         origin_y = parent["center_y"] - parent["radius"]
-        subset = self.df[self.circle_mask(parent)].copy()
+        subset = self.df[self.circle_mask(parent) & self.filter_mask(args)].copy()
         children = []
         if not subset.empty:
             subset["cell_x"] = ((subset["projection_x"] - origin_x) / cell).apply(math.floor)
@@ -571,7 +581,7 @@ class AtlasTools:
                 "center_y": float(region["center_y"]),
                 "radius": float(region["radius"]),
             }
-            subset = self.df[self.circle_mask(probe)]
+            subset = self.df[self.circle_mask(probe) & self.filter_mask(args)]
             comparisons.append(
                 {
                     **probe,
@@ -593,6 +603,7 @@ class AtlasTools:
                 "purity_rationale": "No sampled reviews.",
                 "intent_match": 0,
                 "intent_match_rationale": "No evidence.",
+                "hard_constraint_match": False,
                 "outlier_count": 0,
                 "analyzer_usage": {"total_tokens": 0},
             }
@@ -603,8 +614,11 @@ class AtlasTools:
             ]
         )
         usage: dict[str, Any] = {"total_tokens": 0}
-        for retry in [False, True]:
-            data = self.client.chat(
+        failure_reasons: list[str] = []
+        for attempt in range(3):
+            retry = attempt > 0
+            try:
+                data = self.client.chat(
                 {
                     "model": self.client.model,
                     "messages": [
@@ -616,23 +630,38 @@ class AtlasTools:
                                 if retry
                                 else ""
                             )
-                            + f"User intent: {intent}\n\nAnalyze these {len(reviews)} sampled reviews. If evidence is broad or mixed, return lower purity/intent_match rather than failing.\n\n{reviews_text}",
+                            + f"User intent: {intent}\n\nAnalyze these {len(reviews)} sampled reviews. If evidence is broad or mixed, return lower purity/intent_match rather than failing. hard_constraint_match must be false if any explicit user requirement (such as wine color, price, country, variety, or score) is contradicted by the sample; otherwise true.\n\n{reviews_text}",
                         },
                     ],
-                    "temperature": 0 if retry else 0.2,
+                    "temperature": 0,
                     "max_tokens": 900,
-                    "response_format": {"type": "json_object"},
-                    "include_reasoning": False,
-                    "reasoning": {"exclude": True},
+                    "response_format": {"type": "json_schema", "json_schema": ANALYZER_JSON_SCHEMA},
+                    "reasoning": {"effort": "none", "exclude": True},
+                    "plugins": [{"id": "response-healing"}],
                 },
                 "Wine Atlas Analyzer pilot",
-            )
+                )
+            except Exception as exc:
+                failure_reasons.append(f"request_error:{type(exc).__name__}")
+                continue
             usage = data.get("usage", {})
             content = data.get("choices", [{}])[0].get("message", {}).get("content") or ""
-            parsed = normalize_analysis(parse_json_object(content))
+            if not content.strip():
+                failure_reasons.append("empty_content")
+                continue
+            raw = parse_json_object(content)
+            if raw is None:
+                failure_reasons.append("invalid_json")
+                continue
+            parsed = normalize_analysis(raw)
+            if parsed is None:
+                failure_reasons.append("schema_invalid")
+                continue
             if parsed:
                 parsed["outlier_count"] = int(max(0, min(len(reviews), round(float(parsed.get("outlier_count", 0) or 0)))))
                 parsed["analyzer_usage"] = usage
+                parsed["analyzer_status"] = "ok"
+                parsed["analyzer_attempts"] = attempt + 1
                 return parsed
         return {
             "category": "Analysis failed",
@@ -640,11 +669,14 @@ class AtlasTools:
             "themes": [],
             "quotes": [],
             "purity": 0,
-            "purity_rationale": "Analyzer did not return valid structured evidence after retry.",
+            "purity_rationale": "Analyzer failed after recovery attempts: " + ", ".join(failure_reasons[-3:]),
             "intent_match": 0,
             "intent_match_rationale": "Analyzer did not return valid structured evidence after retry.",
+            "hard_constraint_match": False,
             "outlier_count": len(reviews),
             "analysis_failed": True,
+            "analyzer_status": failure_reasons[-1] if failure_reasons else "unknown_failure",
+            "analyzer_attempts": 3,
             "analyzer_usage": usage,
         }
 
@@ -714,6 +746,7 @@ class Candidate:
     utility: float
     recommended_action: str
     acceptance_tier: str | None
+    hard_constraint_match: bool
     sample_size: int
     review_ids: list[int]
     parent_id: str | None = None
@@ -725,6 +758,9 @@ class Candidate:
 class PilotPolicy:
     target_count: int
     exploration: bool = False
+    has_hard_constraints: bool = False
+    hard_constraint_text: str = ""
+    structured_filters: dict[str, float] = field(default_factory=dict)
     started_at: float = field(default_factory=time.time)
     tool_calls: int = 0
     scans: int = 0
@@ -737,6 +773,7 @@ class PilotPolicy:
     model_cost: float = 0.0
     visited_regions: list[dict[str, Any]] = field(default_factory=list)
     candidates: dict[str, Candidate] = field(default_factory=dict)
+    authorized_regions: dict[str, dict[str, Any]] = field(default_factory=dict)
     events: list[dict[str, Any]] = field(default_factory=list)
     discovered_themes: set[str] = field(default_factory=set)
     relevant_themes: set[str] = field(default_factory=set)
@@ -756,7 +793,7 @@ class PilotPolicy:
         return {
             "must_stop": bool(self.stop_reason),
             "stop_reason": self.stop_reason,
-            "objective": {"target_accepted_regions": self.target_count, "requires_comparison": False, "exploration": self.exploration},
+            "objective": {"target_accepted_regions": self.target_count, "requires_comparison": False, "exploration": self.exploration, "has_hard_constraints": self.has_hard_constraints, "structured_filters": self.structured_filters},
             "remaining": {
                 "toolCalls": max(0, 18 - self.tool_calls),
                 "scans": max(0, 2 - self.scans),
@@ -800,21 +837,30 @@ class PilotPolicy:
             if self.scans >= 2:
                 return None, self.block(call, "scan budget exhausted")
             self.scans += 1
-            return self.accept(call), None
+            return self.accept(self.inject_structured_filters(call, args)), None
         if name == "search_reviews":
             if self.searches >= 4:
                 return None, self.block(call, "structured-search budget exhausted")
             self.searches += 1
-            return self.accept(call), None
+            return self.accept(self.inject_structured_filters(call, args)), None
         if name == "inspect_regions":
+            call = self.inject_structured_filters(call, args)
+            args = json.loads(call["function"].get("arguments") or "{}")
             requested = [region for region in [as_region(item) for item in args.get("regions", [])] if region]
             unique = []
             for region in requested:
+                region_id = str(region.get("id") or "")
+                authorized = self.authorized_regions.get(region_id)
+                can_resample = bool(region_id and region_id in args.get("resample_ids", []) and self.candidates.get(region_id, None) and self.candidates[region_id].recommended_action == "resample")
+                if self.authorized_regions and not authorized and not can_resample:
+                    continue
+                if authorized and not nearly_same_circle(authorized, region):
+                    continue
                 duplicate = any(nearly_same_circle(previous, region) for previous in self.visited_regions + unique)
                 if not duplicate:
                     unique.append(region)
             if not unique:
-                return None, self.block(call, "all requested circles duplicate previously inspected regions")
+                return None, self.block(call, "every probe must use an authorized scan/refine/resample candidate ID and exact geometry")
             accepted = unique[: max(0, 24 - self.inspected_regions)]
             args["regions"] = accepted
             rewritten = {**call, "function": {**call["function"], "arguments": json.dumps(args)}}
@@ -824,6 +870,8 @@ class PilotPolicy:
             self.events.append({"tool": name, "status": "accepted" if len(accepted) == len(requested) else "filtered", "detail": f"{len(accepted)}/{len(requested)} unique probes", "parameters": args})
             return rewritten, None
         if name == "refine_region":
+            call = self.inject_structured_filters(call, args)
+            args = json.loads(call["function"].get("arguments") or "{}")
             parent_id = str(args.get("parent_id") or "")
             parent = self.candidates.get(parent_id)
             if not parent:
@@ -835,6 +883,7 @@ class PilotPolicy:
             self.refinements += 1
             return self.accept(call), None
         if name == "compare_regions":
+            call = self.inject_structured_filters(call, args)
             self.comparisons += 1
             return self.accept(call), None
         if name == "save_results":
@@ -862,6 +911,23 @@ class PilotPolicy:
         self.events.append({"tool": call["function"]["name"], "status": "accepted", "parameters": json.loads(call["function"].get("arguments") or "{}")})
         return call
 
+    def inject_structured_filters(self, call: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
+        accepted = [candidate.id for candidate in self.candidates.values() if candidate.recommended_action == "accept"]
+        frontier = [candidate.id for candidate in self.candidates.values() if candidate.recommended_action in {"refine", "resample", "compare", "explore"}]
+        context = {
+            "version": 1,
+            "hard_filters": self.structured_filters,
+            "semantic_intent": self.hard_constraint_text,
+            "projection_state": {"visited_region_ids": [str(region.get("id")) for region in self.visited_regions if region.get("id")]},
+            "evidence_state": {"accepted_region_ids": accepted, "frontier_region_ids": frontier},
+        }
+        injected = {**args, "search_context": context}
+        for key, value in self.structured_filters.items():
+            injected.setdefault(key, value)
+        if args.get("search_context") == context:
+            return call
+        return {**call, "function": {**call["function"], "arguments": json.dumps(injected)}}
+
     def block(self, call: dict[str, Any], reason: str) -> dict[str, Any]:
         self.events.append({"tool": call["function"]["name"], "status": "blocked", "detail": reason})
         return {
@@ -879,6 +945,20 @@ class PilotPolicy:
         if result.get("error"):
             self.events.append({"tool": result["name"], "status": "failed", "detail": result["error"]})
             return
+        if result["name"] == "scan_regions":
+            for item in result.get("result", {}).get("regions", []):
+                region = as_region(item)
+                if region and region.get("id"):
+                    self.authorized_regions[str(region["id"])] = {**region, "source": "scan"}
+            self.events.append({"tool": result["name"], "status": "completed"})
+            return
+        if result["name"] == "refine_region":
+            for item in result.get("result", {}).get("children", []):
+                region = as_region(item)
+                if region and region.get("id"):
+                    self.authorized_regions[str(region["id"])] = {**region, "source": "refine"}
+            self.events.append({"tool": result["name"], "status": "completed"})
+            return
         if result["name"] != "inspect_regions":
             self.events.append({"tool": result["name"], "status": "completed"})
             return
@@ -894,14 +974,18 @@ class PilotPolicy:
             purity = 0.0 if analysis_failed else score_value(region.get("purity"), 0.0)
             intent_match = 0.0 if analysis_failed else score_value(region.get("intent_match"), 0.0)
             novelty = len([theme for theme in themes if theme not in before_themes]) / len(themes) if themes else 0
-            acceptance_tier = None if analysis_failed else self.acceptance_tier(intent_match, purity, themes)
+            hard_constraint_match = (
+                not self.has_hard_constraints
+                or (region.get("hard_constraint_match") is not False and not violates_obvious_constraint(self.hard_constraint_text, themes))
+            )
+            acceptance_tier = None if analysis_failed or not hard_constraint_match else self.acceptance_tier(intent_match, purity, themes)
             coverage = len([theme for theme in themes if (intent_match >= 0.75 or acceptance_tier) and theme not in before_relevant]) / len(themes) if themes else 0
             agreement = region.get("projection_agreement")
             projection_confidence = 0.5 + 0.5 * score_value(agreement, 0.5) if isinstance(agreement, (int, float)) else 0.75
             confidence = min(1.0, float(region.get("sample_size") or 0) / 12) * projection_confidence
             effective_intent = max(intent_match, 0.75) if acceptance_tier else intent_match
             utility = 0.0 if analysis_failed else max(0.0, min(1.0, 0.45 * effective_intent + 0.20 * purity + 0.15 * novelty + 0.10 * coverage + 0.10 * confidence - 0.05))
-            if analysis_failed or intent_match < 0.60:
+            if analysis_failed or not hard_constraint_match or intent_match < 0.60:
                 action = "reject"
             elif acceptance_tier:
                 action = "accept"
@@ -931,6 +1015,7 @@ class PilotPolicy:
                 utility=round(utility, 3),
                 recommended_action=action,
                 acceptance_tier=acceptance_tier,
+                hard_constraint_match=hard_constraint_match,
                 sample_size=int(region.get("sample_size") or 0),
                 review_ids=[int(value) for value in region.get("review_ids", [])],
                 parent_id=parent_id,
@@ -1002,6 +1087,9 @@ def compact_tool_result(result: dict[str, Any], policy: PilotPolicy) -> dict[str
                 "intent_match": region.get("intent_match"),
                 "projection_agreement": region.get("projection_agreement"),
                 "analysis_failed": bool(region.get("analysis_failed")),
+                "analyzer_status": region.get("analyzer_status"),
+                "analyzer_attempts": region.get("analyzer_attempts"),
+                "purity_rationale": region.get("purity_rationale"),
                 "action": policy.candidates.get(region.get("id")).recommended_action if region.get("id") in policy.candidates else None,
             }
             for region in result["result"].get("regions", [])
@@ -1100,8 +1188,7 @@ def force_final_answer(client: OpenRouterClient, prompt: str, messages: list[dic
             ],
             "temperature": 0,
             "max_tokens": 900,
-            "include_reasoning": False,
-            "reasoning": {"exclude": True},
+            "reasoning": {"effort": "none", "exclude": True},
         },
         "Wine Atlas Agent final pilot",
     )
@@ -1109,8 +1196,33 @@ def force_final_answer(client: OpenRouterClient, prompt: str, messages: list[dic
     return data.get("choices", [{}])[0].get("message", {}).get("content") or ""
 
 
+def fallback_final_answer(policy: PilotPolicy) -> str:
+    candidates = sorted(policy.candidates.values(), key=lambda candidate: candidate.utility, reverse=True)
+    selected = [candidate for candidate in candidates if candidate.recommended_action == "accept"]
+    if not selected:
+        selected = [
+            candidate for candidate in candidates
+            if candidate.hard_constraint_match and candidate.purity >= 0.70 and candidate.intent_match >= 0.65
+        ][: policy.target_count]
+    if not selected:
+        return "I could not verify a sufficiently relevant region within the available search budget."
+    findings = "; ".join(
+        f"{candidate.category} (purity {candidate.purity:.2f}, intent match {candidate.intent_match:.2f})"
+        for candidate in selected[: policy.target_count]
+    )
+    caveat = " Fewer verified regions than requested were found." if len(selected) < policy.target_count else ""
+    return f"Verified regions: {findings}.{caveat}"
+
+
 def run_query(query: dict[str, Any], prompt: str, tools: AtlasTools, client: OpenRouterClient, max_steps: int, seed: int, verbose: bool) -> dict[str, Any]:
-    policy = PilotPolicy(target_count=int(query.get("target_count") or 3), exploration=is_exploration_query(str(query.get("query") or "")))
+    query_text = str(query.get("query") or "")
+    policy = PilotPolicy(
+        target_count=int(query.get("target_count") or 3),
+        exploration=is_exploration_query(query_text),
+        has_hard_constraints=has_hard_constraints(query_text),
+        hard_constraint_text=query_text,
+        structured_filters=extract_structured_filters(query_text),
+    )
     messages: list[dict[str, Any]] = [{"role": "user", "content": query["query"]}]
     final_answer = ""
     tool_result_log: list[dict[str, Any]] = []
@@ -1118,6 +1230,8 @@ def run_query(query: dict[str, Any], prompt: str, tools: AtlasTools, client: Ope
 
     for step in range(1, max_steps + 1):
         snapshot = policy.snapshot()
+        if snapshot["must_stop"]:
+            break
         data = client.chat(
             {
                 "model": client.model,
@@ -1135,8 +1249,7 @@ def run_query(query: dict[str, Any], prompt: str, tools: AtlasTools, client: Ope
                 "tool_choice": "auto",
                 "temperature": 0,
                 "max_tokens": 900,
-                "include_reasoning": False,
-                "reasoning": {"exclude": True},
+                "reasoning": {"effort": "none", "exclude": True},
             },
             "Wine Atlas Agent PAR pilot",
         )
@@ -1164,6 +1277,7 @@ def run_query(query: dict[str, Any], prompt: str, tools: AtlasTools, client: Ope
             break
 
         messages.append({"role": "assistant", "content": message.get("content") or "", "tool_calls": tool_calls})
+        stop_after_turn = False
         for call in tool_calls:
             allowed, blocked = policy.evaluate(call)
             if blocked:
@@ -1182,10 +1296,20 @@ def run_query(query: dict[str, Any], prompt: str, tools: AtlasTools, client: Ope
                     "content": json.dumps(tool_content_for_model(result, policy) if not result.get("error") else result.get("error"), ensure_ascii=False),
                 }
             )
+            if policy.stop_reason:
+                stop_after_turn = True
+                break
+        if stop_after_turn:
+            break
 
     if not final_answer:
-        final_answer = force_final_answer(client, prompt, messages, policy)
+        try:
+            final_answer = force_final_answer(client, prompt, messages, policy)
+        except RuntimeError as exc:
+            policy.events.append({"tool": "final_answer", "status": "failed", "detail": str(exc)})
     final_answer = sanitize_final_answer(final_answer)
+    if not final_answer:
+        final_answer = fallback_final_answer(policy)
 
     latency_ms = int((time.time() - started) * 1000)
     snapshot = policy.snapshot()
@@ -1218,6 +1342,7 @@ def run_query(query: dict[str, Any], prompt: str, tools: AtlasTools, client: Ope
         "utility",
         "recommended_action",
         "acceptance_tier",
+        "hard_constraint_match",
         "density",
         "projection_agreement",
         "review_ids",
@@ -1290,6 +1415,31 @@ def is_exploration_query(query: str) -> bool:
     return bool(re.search(r"\b(explore|discover|find|map|regions?|themes?|styles?|different|distinct|diverse|unusual|open-ended)\b|探索|发现|地图|区域|主题|风格|不同|多样|少见", query, re.I))
 
 
+def has_hard_constraints(query: str) -> bool:
+    return bool(re.search(r"\b(red|white|rosé|rose|sparkling|under\s*\$?\d+|over\s*\$?\d+|less than\s*\$?\d+|more than\s*\$?\d+|from\s+[A-Z][a-z]+|only)\b|红葡萄酒|白葡萄酒|桃红|起泡|低于\s*\$?\d+|高于\s*\$?\d+", query, re.I))
+
+
+def extract_structured_filters(query: str) -> dict[str, float]:
+    filters: dict[str, float] = {}
+    max_match = re.search(r"\b(?:under|below|less than)\s*\$?(\d+(?:\.\d+)?)|低于\s*\$?(\d+(?:\.\d+)?)", query, re.I)
+    min_match = re.search(r"\b(?:over|above|more than)\s*\$?(\d+(?:\.\d+)?)|高于\s*\$?(\d+(?:\.\d+)?)", query, re.I)
+    if max_match:
+        filters["max_price"] = float(next(value for value in max_match.groups() if value is not None))
+    if min_match:
+        filters["min_price"] = float(next(value for value in min_match.groups() if value is not None))
+    return filters
+
+
+def violates_obvious_constraint(query: str, themes: list[str]) -> bool:
+    query_lower = query.lower()
+    evidence = " ".join(themes).lower()
+    asks_red = bool(re.search(r"\bred(?:\s+wines?)?\b|红葡萄酒", query_lower))
+    asks_white = bool(re.search(r"\bwhite(?:\s+wines?)?\b|白葡萄酒", query_lower))
+    has_red = bool(re.search(r"\bred\b|红", evidence))
+    has_white = bool(re.search(r"\bwhite\b|白", evidence))
+    return (asks_red and not asks_white and has_white and not has_red) or (asks_white and not asks_red and has_red and not has_white)
+
+
 def sanitize_final_answer(answer: str) -> str:
     markers = ["<｜DSML｜tool_calls>", "<ï½œDSMLï½œtool_calls>", "<|tool_calls|>"]
     cleaned = answer or ""
@@ -1319,6 +1469,13 @@ def main() -> int:
     parser.add_argument("--summary", type=Path, default=root / "benchmark" / "reports" / f"par_pilot_{timestamp}.json")
     parser.add_argument("--max-steps", type=int, default=8)
     parser.add_argument("--sample-size", type=int, default=8)
+    parser.add_argument("--analyzer-model", type=str, help="Override the model used only for per-region Analyzer calls.")
+    parser.add_argument(
+        "--request-timeout",
+        type=int,
+        default=45,
+        help="Per-request OpenRouter timeout in seconds (default: 45).",
+    )
     parser.add_argument("--seed", type=int, default=43)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -1332,8 +1489,10 @@ def main() -> int:
     prompt = load_prompt(root / "web-app" / "api" / "agentPrompt.ts")
     queries = load_queries(args.queries, args.query_ids)
     random.seed(args.seed)
-    client = OpenRouterClient(api_key=api_key, model=model)
-    tools = AtlasTools(data_path=args.data, client=client, sample_size=args.sample_size, seed=args.seed)
+    analyzer_model = args.analyzer_model or os.environ.get("OPENROUTER_ANALYZER_MODEL") or env.get("OPENROUTER_ANALYZER_MODEL") or model
+    client = OpenRouterClient(api_key=api_key, model=model, timeout=args.request_timeout)
+    analyzer_client = OpenRouterClient(api_key=api_key, model=analyzer_model, timeout=args.request_timeout)
+    tools = AtlasTools(data_path=args.data, client=analyzer_client, sample_size=args.sample_size, seed=args.seed)
 
     records = []
     for query in queries:
@@ -1362,6 +1521,7 @@ def main() -> int:
     summary = {
         "created_at": timestamp,
         "model": model,
+        "analyzer_model": analyzer_model,
         "output": str(args.output),
         "queries": [
             {
